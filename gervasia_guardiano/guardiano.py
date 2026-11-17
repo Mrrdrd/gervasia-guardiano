@@ -529,6 +529,7 @@ class Guardian:
     async def decide(self, req):
         async with self.lock:
             t0 = time.monotonic()
+            steps = []
             acts = []
             final = ""
             visible = {k: v for k, v in req.items() if not k.startswith("_")}
@@ -551,6 +552,7 @@ class Guardian:
                 ctx_task = asyncio.create_task(self.prefetch())
                 go, digging, why = await self.triage(system, json.dumps(base, ensure_ascii=False))
                 triage_s = round(time.monotonic() - t0, 1)
+                steps.append(["triage", triage_s])
                 q = (req.get("heard") or "").lower()
                 if any(w in q for w in ("perché", "perche", "come mai", "cosa è successo", "cos'è successo",
                                          "che è successo", "log", "registro", "why", "what happened")):
@@ -567,17 +569,22 @@ class Guardian:
                     ctx_task.cancel()
                     final = "triage: nessun intervento (%s)" % why
                 else:
+                    tc = time.monotonic()
                     base["contesto_casa"] = await ctx_task
+                    steps.append(["attesa contesto", round(time.monotonic() - tc, 1)])
             except Exception as e:
                 go = True
                 log("triage/prefetch error", e)
             messages = [{"role": "user", "content": json.dumps(base, ensure_ascii=False, default=str)}]
             try:
                 for _ in range(MAX_TOOL_TURNS if go else 0):
+                    tm = time.monotonic()
                     resp = await self.claude.messages.create(
                         model=self.opts.get("model", "claude-sonnet-5-5"), max_tokens=1500,
                         system=[{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
                         tools=self.tool_specs(), messages=messages)
+                    steps.append(["modello", round(time.monotonic() - tm, 1), resp.usage.input_tokens,
+                                  getattr(resp.usage, "cache_read_input_tokens", 0), resp.usage.output_tokens])
                     messages.append({"role": "assistant", "content": resp.content})
                     uses = [b for b in resp.content if b.type == "tool_use"]
                     final = " ".join(b.text for b in resp.content if b.type == "text").strip()
@@ -585,7 +592,9 @@ class Guardian:
                         break
                     results = []
                     for u in uses:
+                        tt = time.monotonic()
                         out = await self.run_tool(u.name, u.input or {}, req, acts)
+                        steps.append(["tool " + u.name, round(time.monotonic() - tt, 1), len(out)])
                         results.append({"type": "tool_result", "tool_use_id": u.id, "content": out})
                     messages.append({"role": "user", "content": results})
             except Exception as e:
@@ -593,7 +602,8 @@ class Guardian:
                 traceback.print_exc()
             secs = round(time.monotonic() - t0, 1)
             entry = {"at": dt.datetime.now().astimezone().isoformat(timespec="seconds"), "secs": secs,
-                     "shadow": self.shadow, "triage_s": triage_s, "request": visible, "actions": acts, "verdict": final}
+                     "shadow": self.shadow, "triage_s": triage_s, "steps": steps, "request": visible, "actions": acts, "verdict": final}
+            log("steps", json.dumps(steps))
             log("decision %.1fs (triage %ss) heard=%r actions=%s verdict=%s" % (secs, triage_s, req.get("heard"), acts, final[:200]))
             try:
                 os.makedirs(os.path.dirname(self.opts["log_file"]), exist_ok=True)
