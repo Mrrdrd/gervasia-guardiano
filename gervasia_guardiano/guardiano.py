@@ -347,6 +347,10 @@ class Guardian:
             if name == "call_service":
                 if args["domain"] in BLOCKED_DOMAINS:
                     return "Bloccato: il dominio %s non è permesso al guardiano." % args["domain"]
+                heard = (req.get("heard") or "").lower()
+                asked_volume = any(w in heard for w in ("volume", "alza", "abbassa", "muto", "silenzi", "louder", "quieter", "mute"))
+                if args["domain"] == "media_player" and args["service"] in ("volume_set", "volume_mute", "volume_up") and not asked_volume:
+                    return "Bloccato: il volume e il muto li decidono le persone. Non cambiarli se non te lo chiedono."
                 res = await self.ha.service(args["domain"], args["service"], args.get("data"), args.get("target"))
                 acts.append({"did": name, "args": args})
                 return short(res or "ok", 1500)
@@ -405,25 +409,86 @@ class Guardian:
                     await self.ha.service("switch", "turn_off", target={"entity_id": m})
 
     # ---------- deciding ----------
+    async def prefetch(self):
+        """House context handed to the model up front, so it needs fewer tool turns."""
+        cfg = self.settings()
+        ids = list(cfg.get("context_entities", [])) + list(cfg.get("mute_switches", []))
+        for sc in cfg.get("satellites", {}).values():
+            if sc.get("sonos_switch"):
+                ids.append(sc["sonos_switch"])
+        states = {}
+        for e in ids:
+            st = await self.ha.state(e)
+            if st:
+                a = st.get("attributes", {})
+                states[e] = {"state": st["state"], "changed": st.get("last_changed", "")[11:19],
+                             **{k: a[k] for k in ("volume_level", "is_volume_muted", "media_title", "media_artist") if k in a}}
+        start = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=5)).isoformat()
+        try:
+            lb = await self.ha.call({"type": "logbook/get_events", "start_time": start})
+            lb = [{"t": str(r.get("when", ""))[11:19] if isinstance(r.get("when"), str) else r.get("when"),
+                   "e": r.get("entity_id"), "s": r.get("state") or r.get("message"),
+                   "by_person": bool(r.get("context_user_id"))}
+                  for r in lb if not str(r.get("entity_id", "")).startswith(("sensor.", "binary_sensor.", "assist_satellite."))][-60:]
+        except Exception as e:
+            lb = "errore %s" % e
+        return {"stati": states, "logbook_5_minuti": lb}
+
+    async def triage(self, system, payload):
+        model = self.opts.get("triage_model", "claude-haiku-5-5")
+        if not model:
+            return True, "nessun triage"
+        prompt = system + ("\n\nTRIAGE. Do not act now. Decide only whether this request needs the guardian: "
+                           "a failure, a useless or 'cannot' answer, a question about the house system, a request "
+                           "addressed to you, or a confirmation of a question you asked. When unsure, say yes. "
+                           "Answer with only a JSON object: {\"intervieni\": true or false, \"motivo\": \"few words\"}.")
+        resp = await self.claude.messages.create(
+            model=model, max_tokens=120,
+            system=[{"type": "text", "text": prompt, "cache_control": {"type": "ephemeral"}}],
+            messages=[{"role": "user", "content": payload}])
+        txt = " ".join(b.text for b in resp.content if b.type == "text")
+        try:
+            js = json.loads(txt[txt.index("{"):txt.rindex("}") + 1])
+            return bool(js.get("intervieni", True)), str(js.get("motivo", ""))
+        except Exception:
+            return True, "triage illeggibile: " + txt[:100]
+
     async def decide(self, req):
         async with self.lock:
             t0 = time.monotonic()
             acts = []
             final = ""
+            visible = {k: v for k, v in req.items() if not k.startswith("_")}
+            real_errors = [e for e in req.get("errors") or []
+                           if (e or {}).get("code") not in ("stt-no-text-recognized", "duplicate_wake_up_detected")]
+            if not (req.get("heard") or "").strip() and not real_errors:
+                log("skip: no text and no error")
+                return
             system = self.instructions()
             if self.shadow:
                 system += ("\n\nMODALITÀ OMBRA ATTIVA: le azioni non vengono eseguite, vengono solo registrate. "
                            "Comportati esattamente come faresti davvero.")
             now = dt.datetime.now().astimezone().strftime("%A %d %B %Y, %H:%M:%S %Z")
-            visible = {k: v for k, v in req.items() if not k.startswith("_")}
             previous = [{k: v for k, v in r.items() if not k.startswith("_")} for r in list(self.history)[:-1]][-6:]
-            messages = [{"role": "user", "content": json.dumps({
-                "ora": now, "richiesta_nuova": visible, "richieste_precedenti": previous,
-                "detto_dal_guardiano": [{"secondi_fa": int(time.time() - t), "testo": x}
-                                        for t, x in self.spoken if time.time() - t < 600]},
-                ensure_ascii=False)}]
+            base = {"ora": now, "richiesta_nuova": visible, "richieste_precedenti": previous,
+                    "detto_dal_guardiano": [{"secondi_fa": int(time.time() - t), "testo": x}
+                                            for t, x in self.spoken if time.time() - t < 600]}
+            triage_s = None
             try:
-                for _ in range(MAX_TOOL_TURNS):
+                ctx_task = asyncio.create_task(self.prefetch())
+                go, why = await self.triage(system, json.dumps(base, ensure_ascii=False))
+                triage_s = round(time.monotonic() - t0, 1)
+                if not go:
+                    ctx_task.cancel()
+                    final = "triage: nessun intervento (%s)" % why
+                else:
+                    base["contesto_casa"] = await ctx_task
+            except Exception as e:
+                go = True
+                log("triage/prefetch error", e)
+            messages = [{"role": "user", "content": json.dumps(base, ensure_ascii=False, default=str)}]
+            try:
+                for _ in range(MAX_TOOL_TURNS if go else 0):
                     resp = await self.claude.messages.create(
                         model=self.opts.get("model", "claude-sonnet-5-5"), max_tokens=1500,
                         system=[{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
@@ -443,8 +508,8 @@ class Guardian:
                 traceback.print_exc()
             secs = round(time.monotonic() - t0, 1)
             entry = {"at": dt.datetime.now().astimezone().isoformat(timespec="seconds"), "secs": secs,
-                     "shadow": self.shadow, "request": visible, "actions": acts, "verdict": final}
-            log("decision %.1fs heard=%r actions=%s verdict=%s" % (secs, req.get("heard"), acts, final[:200]))
+                     "shadow": self.shadow, "triage_s": triage_s, "request": visible, "actions": acts, "verdict": final}
+            log("decision %.1fs (triage %ss) heard=%r actions=%s verdict=%s" % (secs, triage_s, req.get("heard"), acts, final[:200]))
             try:
                 os.makedirs(os.path.dirname(self.opts["log_file"]), exist_ok=True)
                 with open(self.opts["log_file"], "a", encoding="utf-8") as f:
