@@ -52,6 +52,24 @@ def load_options():
         return json.load(f)
 
 
+def hhmmss(w):
+    if isinstance(w, (int, float)):
+        return dt.datetime.fromtimestamp(w).astimezone().strftime("%H:%M:%S")
+    return str(w or "")[11:19]
+
+
+def compact_logbook(rows, limit):
+    """Logbook rows as short tuples: time, entity, new state or message, cause."""
+    out = []
+    for r in rows:
+        e = str(r.get("entity_id") or r.get("domain") or "")
+        if e.startswith(("sensor.", "binary_sensor.", "assist_satellite.", "update.", "sun.")):
+            continue
+        cause = "persona" if r.get("context_user_id") else (r.get("context_entity_id") or r.get("context_event_type") or "")
+        out.append([hhmmss(r.get("when")), e, (r.get("state") or r.get("message") or "")[:60], cause])
+    return out[-limit:]
+
+
 def short(v, n=4000):
     s = v if isinstance(v, str) else json.dumps(v, ensure_ascii=False, default=str)
     return s if len(s) <= n else s[:n] + "...[troncato]"
@@ -337,19 +355,18 @@ class Guardian:
                 res = await self.ha.call({"type": "history/history_during_period", "start_time": start,
                                           "entity_ids": args["entity_ids"], "minimal_response": True,
                                           "no_attributes": True})
-                return short(res, 6000)
+                return short(res, 3000)
             if name == "get_logbook":
                 start = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=args.get("minutes", 10))).isoformat()
                 q = {"type": "logbook/get_events", "start_time": start}
                 if args.get("entity_id"):
                     q["entity_ids"] = [args["entity_id"]]
                 res = await self.ha.call(q)
-                res = [r for r in res if not str(r.get("entity_id", "")).startswith("sensor.")][-150:]
-                return short(res, 8000)
+                return short(compact_logbook(res, 80), 3500)
             if name == "get_system_log":
                 res = await self.ha.call({"type": "system_log/list"})
-                return short([{"level": r.get("level"), "name": r.get("name"), "message": r.get("message"),
-                               "count": r.get("count"), "last": r.get("timestamp")} for r in res[:40]], 6000)
+                return short([[r.get("level"), r.get("name"), str(r.get("message"))[:160], r.get("count"),
+                               hhmmss(r.get("timestamp"))] for r in res[:25]], 3000)
             if name == "get_traces":
                 lst = await self.ha.call({"type": "trace/list", "domain": args["domain"], "item_id": args["item_id"]})
                 lst = sorted(lst, key=lambda t: t.get("timestamp", {}).get("start", ""))[-args.get("count", 3):]
@@ -454,7 +471,7 @@ class Guardian:
                 out["_volumi"] = vols
         except Exception:
             pass
-        return short(out, 9000)
+        return short(out, 5000)
 
     async def tts_url(self, text, req):
         p = self.pipelines.get(req.get("pipeline_id")) or next(
@@ -520,16 +537,31 @@ class Guardian:
                 a = st.get("attributes", {})
                 states[e] = {"state": st["state"], "changed": st.get("last_changed", "")[11:19],
                              **{k: a[k] for k in ("volume_level", "is_volume_muted", "media_title", "media_artist") if k in a}}
-        start = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=5)).isoformat()
+        start = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=10)).isoformat()
+        out = {"stati": states}
         try:
             lb = await self.ha.call({"type": "logbook/get_events", "start_time": start})
-            lb = [{"t": str(r.get("when", ""))[11:19] if isinstance(r.get("when"), str) else r.get("when"),
-                   "e": r.get("entity_id"), "s": r.get("state") or r.get("message"),
-                   "by_person": bool(r.get("context_user_id"))}
-                  for r in lb if not str(r.get("entity_id", "")).startswith(("sensor.", "binary_sensor.", "assist_satellite."))][-60:]
+            out["logbook_10_minuti [ora, entità, stato, causa]"] = compact_logbook(lb, 60)
         except Exception as e:
-            lb = "errore %s" % e
-        return {"stati": states, "logbook_5_minuti": lb}
+            out["logbook_10_minuti"] = "errore %s" % e
+        try:
+            sl = await self.ha.call({"type": "system_log/list"})
+            cutoff = time.time() - 3600
+            out["system_log_ultima_ora [livello, fonte, messaggio, volte, ora]"] = [
+                [r.get("level"), r.get("name"), str(r.get("message"))[:140], r.get("count"), hhmmss(r.get("timestamp"))]
+                for r in sl if (r.get("timestamp") or 0) > cutoff][:12]
+        except Exception as e:
+            out["system_log_ultima_ora"] = "errore %s" % e
+        todo = cfg.get("todo_list")
+        if todo:
+            try:
+                res = await self.ha.call({"type": "call_service", "domain": "todo", "service": "get_items",
+                                          "target": {"entity_id": todo}, "return_response": True})
+                items = (res.get("response") or {}).get(todo, {}).get("items", [])
+                out["lista_da_sistemare"] = [i.get("summary") for i in items if i.get("status") != "completed"][:15]
+            except Exception as e:
+                out["lista_da_sistemare"] = "errore %s" % e
+        return out
 
     async def triage(self, system, payload):
         model = self.opts.get("triage_model", "claude-haiku-5-5")
@@ -605,6 +637,16 @@ class Guardian:
             messages = [{"role": "user", "content": json.dumps(base, ensure_ascii=False, default=str)}]
             try:
                 for _ in range(MAX_TOOL_TURNS if go else 0):
+                    for m in messages:
+                        if isinstance(m["content"], list):
+                            for b in m["content"]:
+                                if isinstance(b, dict):
+                                    b.pop("cache_control", None)
+                    last = messages[-1]
+                    if isinstance(last["content"], str):
+                        last["content"] = [{"type": "text", "text": last["content"]}]
+                    if isinstance(last["content"][-1], dict):
+                        last["content"][-1]["cache_control"] = {"type": "ephemeral"}
                     tm = time.monotonic()
                     resp = await self.claude.messages.create(
                         model=self.opts.get("model", "claude-sonnet-5-5"), max_tokens=1500,
