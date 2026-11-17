@@ -1,0 +1,33 @@
+name: Gervàsia guardiano
+version: "0.1.0"
+slug: gervasia_guardiano
+description: >-
+  Watches every voice request handled by the fast assistant and asks a Claude
+  model whether to step in. Starts in shadow mode: it only writes what it would do.
+url: https://github.com/Mrrdrd/gervasia-guardiano
+arch:
+  - amd64
+  - aarch64
+init: false
+boot: auto
+watchdog: ""
+homeassistant_api: true
+map:
+  - type: homeassistant_config
+    read_only: true
+  - type: share
+    read_only: false
+options:
+  anthropic_api_key: ""
+  model: claude-sonnet-5-5
+  shadow_mode: true
+  instructions_file: /homeassistant/guardiano/istruzioni.txt
+  notify_service: notify.mobile_app_rdr_iphone
+  log_file: /share/guardiano/decisioni.jsonl
+schema:
+  anthropic_api_key: password
+  model: str
+  shadow_mode: bool
+  instructions_file: str
+  notify_service: str
+  log_file: str
