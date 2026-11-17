@@ -15,6 +15,7 @@ import collections
 import datetime as dt
 import json
 import os
+import random
 import time
 import traceback
 
@@ -37,6 +38,8 @@ HOT_WINDOW_S = 25
 HOT_POLL_S = 0.5
 IDLE_POLL_S = 5
 MAX_TOOL_TURNS = 10
+HOLD_LINES = ["Un attimo, controllo.", "Aspetta, do un'occhiata.", "Un secondo, verifico.",
+              "Fammi controllare un attimo.", "Dammi un momento, guardo."]
 
 
 def log(*a):
@@ -147,6 +150,8 @@ class Guardian:
         self.spoken = collections.deque(maxlen=10)   # (time, text) said by the guardian
         self.pipelines = {}
         self.lock = asyncio.Lock()
+        self.speak_lock = asyncio.Lock()
+        self.users = {}
         self.shadow = bool(opts.get("shadow_mode", True))
 
     # ---------- settings ----------
@@ -281,6 +286,10 @@ class Guardian:
              "input_schema": {"type": "object", "properties": {
                  "domain": {"type": "string", "enum": ["script", "automation"]},
                  "item_id": {"type": "string"}, "count": {"type": "integer"}}, "required": ["domain", "item_id"]}},
+            {"name": "reconstruct", "description": "Everything that happened to some entities in the last N minutes (default 180, max 720), in one call: every state change with its time, whether a person, an automation or a script caused it, and the user name when a person did. Use it first for any 'why did X happen' question.",
+             "input_schema": {"type": "object", "properties": {
+                 "entity_ids": {"type": "array", "items": {"type": "string"}},
+                 "minutes": {"type": "integer"}}, "required": ["entity_ids"]}},
             {"name": "get_recent_requests", "description": "The last voice requests seen (heard text, reply, tools Gervàsia called).",
              "input_schema": {"type": "object", "properties": {}}},
             {"name": "call_service", "description": "Call a Home Assistant action (service). Some domains are blocked.",
@@ -342,6 +351,8 @@ class Guardian:
                                 "script_execution": t.get("script_execution"),
                                 "trace": short(full.get("trace"), 2500)})
                 return short(out, 8000)
+            if name == "reconstruct":
+                return await self.reconstruct(args["entity_ids"], min(int(args.get("minutes", 180)), 720))
             if name == "get_recent_requests":
                 return short([{k: v for k, v in r.items() if not k.startswith("_")} for r in self.history], 8000)
             if name == "call_service":
@@ -375,40 +386,101 @@ class Guardian:
         except Exception as e:
             return "errore: %s" % e
 
-    async def speak(self, text, req):
-        cfg = self.settings()
-        sats = cfg.get("satellites", {})
-        sat = req.get("satellite_id") or cfg.get("default_satellite")
-        sc = sats.get(sat) or sats.get(cfg.get("default_satellite"), {})
-        # do not talk over Gervàsia's own reply
-        wait = len(req.get("reply") or "") * 0.07 + 1.5 - (time.monotonic() - req["_intent_end_monotonic"])
-        if wait > 0:
-            await asyncio.sleep(min(wait, 20))
-        mutes = cfg.get("mute_switches", [])
-        before = {m: ((await self.ha.state(m)) or {}).get("state") for m in mutes}
-        for m in mutes:
-            await self.ha.service("switch", "turn_on", target={"entity_id": m})
-        self.spoken.append((time.time(), text))
-        try:
-            on_sonos = sc.get("sonos_switch") and ((await self.ha.state(sc["sonos_switch"])) or {}).get("state") == "on"
-            if on_sonos and cfg.get("sonos_script"):
-                p = self.pipelines.get(req.get("pipeline_id"), {})
-                body = {"engine_id": p.get("tts_engine"), "message": text, "language": p.get("tts_language"),
-                        "options": {"voice": p.get("tts_voice"), "preferred_format": "mp3"}}
-                st, js = await self.ha.rest("POST", "/tts_get_url", body)
-                url = js.get("url") if isinstance(js, dict) else None
-                d, s = cfg["sonos_script"].split(".", 1)
-                await self.ha.service(d, s, {"url": url})
-            else:
-                await self.ha.service("assist_satellite", "announce", {"message": text, "preannounce": False},
-                                      {"entity_id": sat})
-        finally:
-            await asyncio.sleep(len(text) * 0.07 + 2)
-            for m in mutes:
-                if before.get(m) == "off":
-                    await self.ha.service("switch", "turn_off", target={"entity_id": m})
+    async def user_names(self):
+        if not self.users:
+            try:
+                res = await self.ha.call({"type": "config/auth/list"})
+                self.users = {u["id"]: u.get("name") for u in res}
+            except Exception:
+                self.users = {"_": None}
+        return self.users
 
-    # ---------- deciding ----------
+    async def reconstruct(self, entity_ids, minutes):
+        names = await self.user_names()
+        start = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=minutes)).isoformat()
+        out = {}
+        for e in entity_ids[:6]:
+            try:
+                lb = await self.ha.call({"type": "logbook/get_events", "start_time": start, "entity_ids": [e]})
+            except Exception as ex:
+                out[e] = "errore %s" % ex
+                continue
+            rows = []
+            for r in lb:
+                when = r.get("when")
+                if isinstance(when, (int, float)):
+                    when = dt.datetime.fromtimestamp(when).astimezone().strftime("%H:%M:%S")
+                else:
+                    when = str(when)[11:19]
+                uid = r.get("context_user_id")
+                if uid:
+                    cause = "persona: %s" % (names.get(uid) or uid[:8])
+                elif r.get("context_entity_id"):
+                    cause = "da %s" % r.get("context_entity_id")
+                elif r.get("context_event_type"):
+                    cause = r.get("context_event_type")
+                else:
+                    cause = "dispositivo o integrazione"
+                rows.append({"ora": when, "stato": r.get("state") or r.get("message"), "causa": cause,
+                             "servizio": r.get("context_service") or r.get("context_domain")})
+            out[e] = rows[-80:]
+        try:
+            hist = await self.ha.call({"type": "history/history_during_period", "start_time": start,
+                                       "entity_ids": entity_ids[:6], "minimal_response": False,
+                                       "significant_changes_only": False})
+            vols = {}
+            for e, lst in (hist or {}).items():
+                v = []
+                for x in lst:
+                    a = x.get("a") or x.get("attributes") or {}
+                    if "volume_level" in a:
+                        lu = x.get("lu") or x.get("last_updated")
+                        if isinstance(lu, (int, float)):
+                            lu = dt.datetime.fromtimestamp(lu).astimezone().strftime("%H:%M:%S")
+                        v.append((lu, a["volume_level"], a.get("is_volume_muted")))
+                if v:
+                    vols[e] = v[-40:]
+            if vols:
+                out["_volumi"] = vols
+        except Exception:
+            pass
+        return short(out, 9000)
+
+    async def speak(self, text, req):
+      async with self.speak_lock:
+          cfg = self.settings()
+          sats = cfg.get("satellites", {})
+          sat = req.get("satellite_id") or cfg.get("default_satellite")
+          sc = sats.get(sat) or sats.get(cfg.get("default_satellite"), {})
+          # do not talk over Gervàsia's own reply
+          wait = len(req.get("reply") or "") * 0.07 + 1.5 - (time.monotonic() - req["_intent_end_monotonic"])
+          if wait > 0:
+              await asyncio.sleep(min(wait, 20))
+          mutes = cfg.get("mute_switches", [])
+          before = {m: ((await self.ha.state(m)) or {}).get("state") for m in mutes}
+          for m in mutes:
+              await self.ha.service("switch", "turn_on", target={"entity_id": m})
+          self.spoken.append((time.time(), text))
+          try:
+              on_sonos = sc.get("sonos_switch") and ((await self.ha.state(sc["sonos_switch"])) or {}).get("state") == "on"
+              if on_sonos and cfg.get("sonos_script"):
+                  p = self.pipelines.get(req.get("pipeline_id"), {})
+                  body = {"engine_id": p.get("tts_engine"), "message": text, "language": p.get("tts_language"),
+                          "options": {"voice": p.get("tts_voice"), "preferred_format": "mp3"}}
+                  st, js = await self.ha.rest("POST", "/tts_get_url", body)
+                  url = js.get("url") if isinstance(js, dict) else None
+                  d, s = cfg["sonos_script"].split(".", 1)
+                  await self.ha.service(d, s, {"url": url})
+              else:
+                  await self.ha.service("assist_satellite", "announce", {"message": text, "preannounce": False},
+                                        {"entity_id": sat})
+          finally:
+              await asyncio.sleep(len(text) * 0.07 + 2)
+              for m in mutes:
+                  if before.get(m) == "off":
+                      await self.ha.service("switch", "turn_off", target={"entity_id": m})
+
+      # ---------- deciding ----------
     async def prefetch(self):
         """House context handed to the model up front, so it needs fewer tool turns."""
         cfg = self.settings()
@@ -437,11 +509,12 @@ class Guardian:
     async def triage(self, system, payload):
         model = self.opts.get("triage_model", "claude-haiku-5-5")
         if not model:
-            return True, "nessun triage"
+            return True, False, "nessun triage"
         prompt = system + ("\n\nTRIAGE. Do not act now. Decide only whether this request needs the guardian: "
                            "a failure, a useless or 'cannot' answer, a question about the house system, a request "
                            "addressed to you, or a confirmation of a question you asked. When unsure, say yes. "
-                           "Answer with only a JSON object: {\"intervieni\": true or false, \"motivo\": \"few words\"}.")
+                           "Set indagine true when answering needs digging into history or logs (why something happened, what went wrong). "
+                           "Answer with only a JSON object: {\"intervieni\": true or false, \"indagine\": true or false, \"motivo\": \"few words\"}.")
         resp = await self.claude.messages.create(
             model=model, max_tokens=120,
             system=[{"type": "text", "text": prompt, "cache_control": {"type": "ephemeral"}}],
@@ -449,9 +522,9 @@ class Guardian:
         txt = " ".join(b.text for b in resp.content if b.type == "text")
         try:
             js = json.loads(txt[txt.index("{"):txt.rindex("}") + 1])
-            return bool(js.get("intervieni", True)), str(js.get("motivo", ""))
+            return bool(js.get("intervieni", True)), bool(js.get("indagine", False)), str(js.get("motivo", ""))
         except Exception:
-            return True, "triage illeggibile: " + txt[:100]
+            return True, False, "triage illeggibile: " + txt[:100]
 
     async def decide(self, req):
         async with self.lock:
@@ -476,8 +549,16 @@ class Guardian:
             triage_s = None
             try:
                 ctx_task = asyncio.create_task(self.prefetch())
-                go, why = await self.triage(system, json.dumps(base, ensure_ascii=False))
+                go, digging, why = await self.triage(system, json.dumps(base, ensure_ascii=False))
                 triage_s = round(time.monotonic() - t0, 1)
+                if go and digging:
+                    hold = random.choice(HOLD_LINES)
+                    if self.shadow:
+                        acts.append({"would": "speak", "args": {"text": hold}, "note": "frase d'attesa"})
+                    else:
+                        asyncio.create_task(self.speak(hold, req))
+                        acts.append({"did": "speak", "args": {"text": hold}, "note": "frase d'attesa"})
+                    base["frase_di_attesa_gia_detta"] = hold
                 if not go:
                     ctx_task.cancel()
                     final = "triage: nessun intervento (%s)" % why
