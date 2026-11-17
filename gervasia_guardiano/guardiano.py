@@ -297,11 +297,9 @@ class Guardian:
              "input_schema": {"type": "object", "properties": {
                  "entity_ids": {"type": "array", "items": {"type": "string"}},
                  "minutes": {"type": "integer"}}, "required": ["entity_ids"]}},
-            {"name": "get_logbook", "description": "Logbook of the last N minutes (what changed and what triggered it), optionally for one entity.",
+            {"name": "get_logbook", "description": "Logbook further back than the 10 minutes you already have (minutes must be more than 10), optionally for one entity. For one or a few entities prefer reconstruct.",
              "input_schema": {"type": "object", "properties": {
                  "minutes": {"type": "integer"}, "entity_id": {"type": "string"}}}},
-            {"name": "get_system_log", "description": "Recent warnings and errors from the Home Assistant system log.",
-             "input_schema": {"type": "object", "properties": {}}},
             {"name": "get_traces", "description": "Recent run traces of a script or automation (domain script or automation, item_id without the domain).",
              "input_schema": {"type": "object", "properties": {
                  "domain": {"type": "string", "enum": ["script", "automation"]},
@@ -310,8 +308,6 @@ class Guardian:
              "input_schema": {"type": "object", "properties": {
                  "entity_ids": {"type": "array", "items": {"type": "string"}},
                  "minutes": {"type": "integer"}}, "required": ["entity_ids"]}},
-            {"name": "get_recent_requests", "description": "The last voice requests seen (heard text, reply, tools Gervàsia called).",
-             "input_schema": {"type": "object", "properties": {}}},
             {"name": "call_service", "description": "Call a Home Assistant action (service). Some domains are blocked.",
              "input_schema": {"type": "object", "properties": {
                  "domain": {"type": "string"}, "service": {"type": "string"},
@@ -356,6 +352,8 @@ class Guardian:
                                           "entity_ids": args["entity_ids"], "minimal_response": True,
                                           "no_attributes": True})
                 return short(res, 3000)
+            if name == "get_logbook" and int(args.get("minutes", 10)) <= 10 and not args.get("entity_id"):
+                return "Hai già il logbook degli ultimi 10 minuti in contesto_casa: usalo."
             if name == "get_logbook":
                 start = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=args.get("minutes", 10))).isoformat()
                 q = {"type": "logbook/get_events", "start_time": start}
@@ -600,7 +598,7 @@ class Guardian:
                 system += ("\n\nMODALITÀ OMBRA ATTIVA: le azioni non vengono eseguite, vengono solo registrate. "
                            "Comportati esattamente come faresti davvero.")
             now = dt.datetime.now().astimezone().strftime("%A %d %B %Y, %H:%M:%S %Z")
-            previous = [{k: v for k, v in r.items() if not k.startswith("_")} for r in list(self.history)[:-1]][-6:]
+            previous = [{k: v for k, v in r.items() if not k.startswith("_")} for r in list(self.history)[:-1]][-10:]
             base = {"ora": now, "richiesta_nuova": visible, "richieste_precedenti": previous,
                     "gia_segnalato_ultimi_30_minuti": [{"minuti_fa": int((time.time() - t) // 60), "tipo": k, "testo": x[:120]}
                                                        for t, k, x in self.reported if time.time() - t < REPORT_QUIET_S],
