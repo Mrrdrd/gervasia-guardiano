@@ -551,6 +551,10 @@ class Guardian:
                 ctx_task = asyncio.create_task(self.prefetch())
                 go, digging, why = await self.triage(system, json.dumps(base, ensure_ascii=False))
                 triage_s = round(time.monotonic() - t0, 1)
+                q = (req.get("heard") or "").lower()
+                if any(w in q for w in ("perché", "perche", "come mai", "cosa è successo", "cos'è successo",
+                                         "che è successo", "log", "registro", "why", "what happened")):
+                    digging = True
                 if go and digging:
                     hold = random.choice(HOLD_LINES)
                     if self.shadow:
