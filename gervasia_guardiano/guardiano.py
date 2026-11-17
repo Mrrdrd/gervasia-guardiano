@@ -412,7 +412,9 @@ class Guardian:
             visible = {k: v for k, v in req.items() if not k.startswith("_")}
             previous = [{k: v for k, v in r.items() if not k.startswith("_")} for r in list(self.history)[:-1]][-6:]
             messages = [{"role": "user", "content": json.dumps({
-                "ora": now, "richiesta_nuova": visible, "richieste_precedenti": previous},
+                "ora": now, "richiesta_nuova": visible, "richieste_precedenti": previous,
+                "detto_dal_guardiano": [{"secondi_fa": int(time.time() - t), "testo": x}
+                                        for t, x in self.spoken if time.time() - t < 600]},
                 ensure_ascii=False)}]
             try:
                 for _ in range(MAX_TOOL_TURNS):
