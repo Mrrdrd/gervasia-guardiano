@@ -205,6 +205,11 @@ class Guardian:
         if errors and all((e or {}).get("code") == "duplicate_wake_up_detected" for e in errors) and not stt:
             return None
         heard = ((stt or {}).get("data") or {}).get("stt_output", {}).get("text", "")
+        typed = False
+        if not heard:
+            ist = get("intent-start")
+            heard = ((ist or {}).get("data") or {}).get("intent_input", "") or ""
+            typed = bool(heard)
         reply = ""
         cont = None
         if ie:
@@ -230,6 +235,7 @@ class Guardian:
             "satellite_id": ((rs or {}).get("data") or {}).get("satellite_id"),
             "conversation_id": ((rs or {}).get("data") or {}).get("conversation_id"),
             "heard": heard,
+            "typed_not_spoken": typed,
             "reply": reply,
             "continue_conversation": cont,
             "tool_calls": tools,
