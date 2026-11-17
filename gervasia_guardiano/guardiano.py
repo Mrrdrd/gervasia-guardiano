@@ -38,6 +38,13 @@ HOT_WINDOW_S = 25
 HOT_POLL_S = 0.5
 IDLE_POLL_S = 5
 MAX_TOOL_TURNS = 10
+READ_TOOLS = {"get_states", "get_history", "get_logbook", "get_traces", "reconstruct"}
+PREP_RULES = ("\n\nPREPARATION. Gervàsia is answering this request right now and you do not see her reply yet. "
+              "Prepare the one or two short Italian sentences you would speak, as Gervàsia, if her reply turns out "
+              "useless or wrong: open with the comic handoff line of 3.3, then the real answer. Use the read tools only "
+              "if the context is not enough. If the request needs an action in the house (turning something on, "
+              "playing something) rather than an answer, or it is chatter not meant for her, reply exactly NESSUNA. "
+              "Reply with only the sentences, nothing else.")
 REPORT_QUIET_S = 30 * 60
 HOLD_LINES = ["Un attimo, controllo.", "Aspetta, do un'occhiata.", "Un secondo, verifico.",
               "Fammi controllare un attimo.", "Dammi un momento, guardo."]
@@ -171,6 +178,7 @@ class Guardian:
         self.lock = asyncio.Lock()
         self.speak_lock = asyncio.Lock()
         self.users = {}
+        self.preps = {}   # pipeline_run_id -> task preparing an answer while Gervàsia is still answering
         self.reported = collections.deque(maxlen=30)   # (time, kind, text) alerts and to-dos already raised
         self.shadow = bool(opts.get("shadow_mode", True))
 
@@ -215,13 +223,71 @@ class Guardian:
                 ev = det.get("events", [])
                 types = [e["type"] for e in ev]
                 if "intent-end" not in types and "error" not in types and "run-end" not in types:
+                    if rid not in self.preps:
+                        heard = self.heard_text(ev)
+                        if heard:
+                            self.preps[rid] = asyncio.create_task(self.prepare(heard, p))
                     continue   # still running, look again later
                 self.seen.add(rid)
                 summary = self.summarise(p, run, ev)
                 if summary is None:
+                    task = self.preps.pop(rid, None)
+                    if task:
+                        task.cancel()
                     continue
+                summary["_rid"] = rid
+                if rid not in self.preps and summary.get("heard"):
+                    # the run finished between two polls: start preparing now
+                    self.preps[rid] = asyncio.create_task(self.prepare(summary["heard"], p))
                 self.history.append(summary)
                 asyncio.create_task(self.decide(summary))
+
+    @staticmethod
+    def heard_text(events):
+        for e in events:
+            if e["type"] == "stt-end":
+                return ((e.get("data") or {}).get("stt_output") or {}).get("text", "")
+        for e in events:
+            if e["type"] == "intent-start":
+                return (e.get("data") or {}).get("intent_input", "") or ""
+        return ""
+
+    async def prepare(self, heard, pipeline):
+        """While Gervàsia is answering, prepare what the guardian would say if she fails."""
+        t0 = time.monotonic()
+        system = self.instructions() + PREP_RULES
+        previous = [{k: v for k, v in r.items() if not k.startswith("_")} for r in list(self.history)][-10:]
+        try:
+            ctx = await self.prefetch()
+            messages = [{"role": "user", "content": json.dumps({
+                "ora": dt.datetime.now().astimezone().strftime("%A %d %B %Y, %H:%M:%S %Z"),
+                "richiesta_in_corso": heard, "assistente": pipeline.get("name"),
+                "richieste_precedenti": previous, "contesto_casa": ctx}, ensure_ascii=False, default=str)}]
+            read_tools = [t for t in self.tool_specs() if t["name"] in READ_TOOLS]
+            draft = ""
+            for _ in range(5):
+                resp = await self.claude.messages.create(
+                    model=self.opts.get("model", "claude-sonnet-5-5"), max_tokens=600,
+                    system=[{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
+                    tools=read_tools, messages=messages)
+                messages.append({"role": "assistant", "content": resp.content})
+                uses = [b for b in resp.content if b.type == "tool_use"]
+                draft = " ".join(b.text for b in resp.content if b.type == "text").strip()
+                if not uses:
+                    break
+                results = []
+                for u in uses:
+                    out = await self.run_tool(u.name, u.input or {}, {}, []) if u.name in READ_TOOLS else "non disponibile"
+                    results.append({"type": "tool_result", "tool_use_id": u.id, "content": out})
+                messages.append({"role": "user", "content": results})
+            if not draft or draft.upper().startswith("NESSUNA"):
+                draft = ""
+            return {"draft": draft, "secs": round(time.monotonic() - t0, 1)}
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log("prepare error", e)
+            return {"draft": "", "secs": round(time.monotonic() - t0, 1), "error": str(e)}
 
     def summarise(self, pipeline, run, events):
         get = lambda t: next((e for e in events if e["type"] == t), None)
@@ -564,12 +630,13 @@ class Guardian:
     async def triage(self, system, payload):
         model = self.opts.get("triage_model", "claude-haiku-5-5")
         if not model:
-            return True, False, "nessun triage"
+            return True, False, True, "nessun triage"
         prompt = system + ("\n\nTRIAGE. Do not act now. Decide only whether this request needs the guardian: "
                            "a failure, a useless or 'cannot' answer, a question about the house system, a request "
                            "addressed to you, or a confirmation of a question you asked. When unsure, say yes. "
                            "Set indagine true when answering needs digging into history or logs (why something happened, what went wrong). "
-                           "Answer with only a JSON object: {\"intervieni\": true or false, \"indagine\": true or false, \"motivo\": \"few words\"}.")
+                           "Set azione true when fixing it needs doing something in the house, not just giving an answer. "
+                           "Answer with only a JSON object: {\"intervieni\": true or false, \"indagine\": true or false, \"azione\": true or false, \"motivo\": \"few words\"}.")
         resp = await self.claude.messages.create(
             model=model, max_tokens=120,
             system=[{"type": "text", "text": prompt, "cache_control": {"type": "ephemeral"}}],
@@ -577,9 +644,10 @@ class Guardian:
         txt = " ".join(b.text for b in resp.content if b.type == "text")
         try:
             js = json.loads(txt[txt.index("{"):txt.rindex("}") + 1])
-            return bool(js.get("intervieni", True)), bool(js.get("indagine", False)), str(js.get("motivo", ""))
+            return (bool(js.get("intervieni", True)), bool(js.get("indagine", False)),
+                    bool(js.get("azione", True)), str(js.get("motivo", "")))
         except Exception:
-            return True, False, "triage illeggibile: " + txt[:100]
+            return True, False, True, "triage illeggibile: " + txt[:100]
 
     async def decide(self, req):
         async with self.lock:
@@ -607,9 +675,13 @@ class Guardian:
             triage_s = None
             try:
                 ctx_task = asyncio.create_task(self.prefetch())
-                go, digging, why = await self.triage(system, json.dumps(base, ensure_ascii=False))
+                go, digging, needs_action, why = await self.triage(system, json.dumps(base, ensure_ascii=False))
                 triage_s = round(time.monotonic() - t0, 1)
                 steps.append(["triage", triage_s])
+                prep = self.preps.pop(req.get("_rid"), None)
+                if go and prep and not needs_action:
+                    if not prep.done():
+                        digging = True   # the prepared answer is not ready yet: say a holding line first
                 q = (req.get("heard") or "").lower()
                 if any(w in q for w in ("perché", "perche", "come mai", "cosa è successo", "cos'è successo",
                                          "che è successo", "log", "registro", "why", "what happened")):
@@ -622,7 +694,28 @@ class Guardian:
                         asyncio.create_task(self.speak(hold, req))
                         acts.append({"did": "speak", "args": {"text": hold}, "note": "frase d'attesa"})
                     base["frase_di_attesa_gia_detta"] = hold
-                if not go:
+                ready = None
+                if go and prep and not needs_action:
+                    tw = time.monotonic()
+                    try:
+                        ready = await asyncio.wait_for(prep, 25)
+                    except Exception:
+                        ready = None
+                    steps.append(["attesa bozza", round(time.monotonic() - tw, 1)])
+                elif prep:
+                    prep.cancel()
+                if ready and ready.get("draft"):
+                    ctx_task.cancel()
+                    go = False
+                    draft = ready["draft"]
+                    steps.append(["bozza pronta dopo", ready.get("secs")])
+                    if self.shadow:
+                        acts.append({"would": "speak", "args": {"text": draft}, "note": "risposta preparata"})
+                    else:
+                        await self.speak(draft, req)
+                        acts.append({"did": "speak", "args": {"text": draft}, "note": "risposta preparata"})
+                    final = "risposta preparata in anticipo (%s)" % why
+                elif not go:
                     ctx_task.cancel()
                     final = "triage: nessun intervento (%s)" % why
                 else:
