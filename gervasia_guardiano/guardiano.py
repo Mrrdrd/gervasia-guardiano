@@ -38,6 +38,7 @@ HOT_WINDOW_S = 25
 HOT_POLL_S = 0.5
 IDLE_POLL_S = 5
 MAX_TOOL_TURNS = 10
+REPORT_QUIET_S = 30 * 60
 HOLD_LINES = ["Un attimo, controllo.", "Aspetta, do un'occhiata.", "Un secondo, verifico.",
               "Fammi controllare un attimo.", "Dammi un momento, guardo."]
 
@@ -152,6 +153,7 @@ class Guardian:
         self.lock = asyncio.Lock()
         self.speak_lock = asyncio.Lock()
         self.users = {}
+        self.reported = collections.deque(maxlen=30)   # (time, kind, text) alerts and to-dos already raised
         self.shadow = bool(opts.get("shadow_mode", True))
 
     # ---------- settings ----------
@@ -307,6 +309,14 @@ class Guardian:
 
     async def run_tool(self, name, args, req, acts):
         acting = name in ("call_service", "speak", "notify_gabe", "add_todo")
+        if name in ("notify_gabe", "add_todo"):
+            now = time.time()
+            recent = [(t, k, x) for t, k, x in self.reported if k == name and now - t < REPORT_QUIET_S]
+            if recent:
+                t, k, x = recent[-1]
+                return ("Già segnalato %d minuti fa (\"%s\"): non ripetere la stessa segnalazione. "
+                        "Se è un problema davvero diverso, scrivilo solo nella riga finale." % ((now - t) // 60, x[:80]))
+            self.reported.append((now, name, args.get("text") or args.get("title") or ""))
         if acting and self.shadow:
             acts.append({"would": name, "args": args})
             return "MODALITÀ OMBRA: non eseguito. Continua come se fosse andato a buon fine."
@@ -446,6 +456,14 @@ class Guardian:
             pass
         return short(out, 9000)
 
+    async def tts_url(self, text, req):
+        p = self.pipelines.get(req.get("pipeline_id")) or next(
+            (x for x in self.pipelines.values() if "gerv" in (x.get("name") or "").lower()), {})
+        body = {"engine_id": p.get("tts_engine"), "message": text, "language": p.get("tts_language"),
+                "options": {"voice": p.get("tts_voice"), "preferred_format": "mp3"}}
+        st, js = await self.ha.rest("POST", "/tts_get_url", body)
+        return js.get("url") if isinstance(js, dict) else None
+
     async def speak(self, text, req):
       async with self.speak_lock:
           cfg = self.settings()
@@ -464,16 +482,23 @@ class Guardian:
           try:
               on_sonos = sc.get("sonos_switch") and ((await self.ha.state(sc["sonos_switch"])) or {}).get("state") == "on"
               if on_sonos and cfg.get("sonos_script"):
-                  p = self.pipelines.get(req.get("pipeline_id"), {})
-                  body = {"engine_id": p.get("tts_engine"), "message": text, "language": p.get("tts_language"),
-                          "options": {"voice": p.get("tts_voice"), "preferred_format": "mp3"}}
-                  st, js = await self.ha.rest("POST", "/tts_get_url", body)
-                  url = js.get("url") if isinstance(js, dict) else None
+                  url = await self.tts_url(text, req)
                   d, s = cfg["sonos_script"].split(".", 1)
                   await self.ha.service(d, s, {"url": url})
               else:
-                  await self.ha.service("assist_satellite", "announce", {"message": text, "preannounce": False},
-                                        {"entity_id": sat})
+                  try:
+                      await self.ha.service("assist_satellite", "announce", {"message": text, "preannounce": False},
+                                            {"entity_id": sat})
+                  except Exception as e:
+                      # some satellites (the BOX-3) do not support announce: play on their media player
+                      mp = sc.get("media_player")
+                      if not mp:
+                          raise
+                      log("announce not supported on %s (%s), using %s" % (sat, e, mp))
+                      url = await self.tts_url(text, req)
+                      await self.ha.service("media_player", "play_media",
+                                            {"media_content_id": url, "media_content_type": "music", "announce": True},
+                                            {"entity_id": mp})
           finally:
               await asyncio.sleep(len(text) * 0.07 + 2)
               for m in mutes:
@@ -545,6 +570,8 @@ class Guardian:
             now = dt.datetime.now().astimezone().strftime("%A %d %B %Y, %H:%M:%S %Z")
             previous = [{k: v for k, v in r.items() if not k.startswith("_")} for r in list(self.history)[:-1]][-6:]
             base = {"ora": now, "richiesta_nuova": visible, "richieste_precedenti": previous,
+                    "gia_segnalato_ultimi_30_minuti": [{"minuti_fa": int((time.time() - t) // 60), "tipo": k, "testo": x[:120]}
+                                                       for t, k, x in self.reported if time.time() - t < REPORT_QUIET_S],
                     "detto_dal_guardiano": [{"secondi_fa": int(time.time() - t), "testo": x}
                                             for t, x in self.spoken if time.time() - t < 600]}
             triage_s = None
