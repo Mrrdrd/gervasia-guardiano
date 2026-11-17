@@ -1,5 +1,4 @@
-ARG BUILD_FROM
-FROM ${BUILD_FROM}
+FROM python:3.13-slim
 
 RUN pip3 install --no-cache-dir anthropic==2.9.0 aiohttp==3.14.5
 
