@@ -16,6 +16,7 @@ import datetime as dt
 import json
 import os
 import random
+import re
 import time
 import traceback
 
@@ -38,6 +39,9 @@ HOT_WINDOW_S = 25
 HOT_POLL_S = 0.5
 IDLE_POLL_S = 5
 MAX_TOOL_TURNS = 10
+OBVIOUS_FAILURE = re.compile(r"non posso|non riesco|non ho accesso|non ho (?:uno |gli |lo |un )?strument|non trovo|"
+                             r"non è possibile|non sono in grado|insufficient funds|si è verificato un errore", re.I)
+REPORT_QUIET_S = 30 * 60
 HOLD_LINES = ["Un attimo, controllo.", "Aspetta, do un'occhiata.", "Un secondo, verifico.",
               "Fammi controllare un attimo.", "Dammi un momento, guardo."]
 
@@ -152,6 +156,7 @@ class Guardian:
         self.lock = asyncio.Lock()
         self.speak_lock = asyncio.Lock()
         self.users = {}
+        self.reported = collections.deque(maxlen=30)   # (time, kind, text) alerts and to-dos already raised
         self.shadow = bool(opts.get("shadow_mode", True))
 
     # ---------- settings ----------
@@ -203,9 +208,14 @@ class Guardian:
                 self.history.append(summary)
                 asyncio.create_task(self.decide(summary))
 
+    def test_mode(self):
+        """A file named "test" next to the instructions makes typed requests count as spoken (silent tests)."""
+        return os.path.exists(os.path.join(os.path.dirname(self.opts["instructions_file"]), "test"))
+
     @staticmethod
     def is_test_pipeline(pipeline):
-        # test environment ported from 0.9.x: nothing else differs from the Nov 17 08:14 version
+        """The "Gervàsia Test" pipeline: requests there are handled as if live, but nothing touches the house.
+        Speech goes to input_text.guardiano_test_nuovo, other actions are only recorded."""
         return "test" in (pipeline.get("name") or "").lower()
 
     def summarise(self, pipeline, run, events):
@@ -244,10 +254,10 @@ class Guardian:
             "assistant": pipeline.get("name"),
             "pipeline_id": pipeline.get("id"),
             "satellite_id": ((rs or {}).get("data") or {}).get("satellite_id")
-                            or (self.settings().get("default_satellite") if typed and is_test else None),
+                            or (self.settings().get("default_satellite") if typed and (is_test or self.test_mode()) else None),
             "conversation_id": ((rs or {}).get("data") or {}).get("conversation_id"),
             "heard": heard,
-            "typed_not_spoken": typed and not is_test,
+            "typed_not_spoken": typed and not (is_test or self.test_mode()),
             "reply": reply,
             "continue_conversation": cont,
             "tool_calls": tools,
@@ -318,14 +328,15 @@ class Guardian:
         if req.get("_test") and name == "call_service" and (str(args.get("service", "")).startswith("get_")
                                                            or args.get("service") == "search"):
             acting = False  # test environment: read-only services (todo.get_items, search...) really run
-        if acting and req.get("_test"):
-            if name == "speak":
-                self.spoken.append((time.time(), args.get("text", "")))
-                await self.ha.service("input_text", "set_value",
-                                      {"value": (dt.datetime.now().strftime("%H:%M:%S ") + args.get("text", ""))[:255]},
-                                      {"entity_id": "input_text.guardiano_test_nuovo"})
-                acts.append({"did": name, "args": args})
-                return "detto"
+        if name in ("notify_gabe", "add_todo"):
+            now = time.time()
+            recent = [(t, k, x) for t, k, x in self.reported if k == name and now - t < REPORT_QUIET_S]
+            if recent:
+                t, k, x = recent[-1]
+                return ("Già segnalato %d minuti fa (\"%s\"): non ripetere la stessa segnalazione. "
+                        "Se è un problema davvero diverso, scrivilo solo nella riga finale." % ((now - t) // 60, x[:80]))
+            self.reported.append((now, name, args.get("text") or args.get("title") or ""))
+        if acting and req.get("_test") and name != "speak":
             if name == "call_service":
                 if args.get("domain") in BLOCKED_DOMAINS:
                     return "Bloccato: il dominio %s non è permesso al guardiano." % args["domain"]
@@ -333,12 +344,12 @@ class Guardian:
                 asked_volume = any(w in heard for w in ("volume", "alza", "abbassa", "muto", "silenzi", "louder", "quieter", "mute"))
                 if args.get("domain") == "media_player" and args.get("service") in ("volume_set", "volume_mute", "volume_up") and not asked_volume:
                     return "Bloccato: il volume e il muto li decidono le persone. Non cambiarli se non te lo chiedono."
-                acts.append({"test": name, "args": args})
+            acts.append({"test": name, "args": args})
+            if name == "call_service":
                 return ("ok. AMBIENTE DI TEST: l'azione è simulata, gli stati reali non cambiano. "
                         "Considerala riuscita e non verificarla.")
-            acts.append({"test": name, "args": args})
             return {"notify_gabe": "inviato", "add_todo": "aggiunto"}[name]
-        if acting and self.shadow:
+        if acting and self.shadow and not req.get("_test"):
             acts.append({"would": name, "args": args})
             return "MODALITÀ OMBRA: non eseguito. Continua come se fosse andato a buon fine."
         try:
@@ -477,7 +488,23 @@ class Guardian:
             pass
         return short(out, 9000)
 
+    async def tts_url(self, text, req):
+        p = self.pipelines.get(req.get("pipeline_id")) or next(
+            (x for x in self.pipelines.values() if "gerv" in (x.get("name") or "").lower()), {})
+        body = {"engine_id": p.get("tts_engine"), "message": text, "language": p.get("tts_language"),
+                "options": {"voice": p.get("tts_voice"), "preferred_format": "mp3"}}
+        st, js = await self.ha.rest("POST", "/tts_get_url", body)
+        return js.get("url") if isinstance(js, dict) else None
+
     async def speak(self, text, req):
+      if req.get("_test"):
+          # test environment: "say" it into a helper instead of a speaker, at once, so timings measure the
+          # guardian only (live, it also waits for Gervàsia's reply to finish, the same for every version)
+          self.spoken.append((time.time(), text))
+          await self.ha.service("input_text", "set_value",
+                                {"value": (dt.datetime.now().strftime("%H:%M:%S ") + text)[:255]},
+                                {"entity_id": "input_text.guardiano_test_nuovo"})
+          return
       async with self.speak_lock:
           cfg = self.settings()
           sats = cfg.get("satellites", {})
@@ -495,16 +522,23 @@ class Guardian:
           try:
               on_sonos = sc.get("sonos_switch") and ((await self.ha.state(sc["sonos_switch"])) or {}).get("state") == "on"
               if on_sonos and cfg.get("sonos_script"):
-                  p = self.pipelines.get(req.get("pipeline_id"), {})
-                  body = {"engine_id": p.get("tts_engine"), "message": text, "language": p.get("tts_language"),
-                          "options": {"voice": p.get("tts_voice"), "preferred_format": "mp3"}}
-                  st, js = await self.ha.rest("POST", "/tts_get_url", body)
-                  url = js.get("url") if isinstance(js, dict) else None
+                  url = await self.tts_url(text, req)
                   d, s = cfg["sonos_script"].split(".", 1)
                   await self.ha.service(d, s, {"url": url})
               else:
-                  await self.ha.service("assist_satellite", "announce", {"message": text, "preannounce": False},
-                                        {"entity_id": sat})
+                  try:
+                      await self.ha.service("assist_satellite", "announce", {"message": text, "preannounce": False},
+                                            {"entity_id": sat})
+                  except Exception as e:
+                      # some satellites (the BOX-3) do not support announce: play on their media player
+                      mp = sc.get("media_player")
+                      if not mp:
+                          raise
+                      log("announce not supported on %s (%s), using %s" % (sat, e, mp))
+                      url = await self.tts_url(text, req)
+                      await self.ha.service("media_player", "play_media",
+                                            {"media_content_id": url, "media_content_type": "music", "announce": True},
+                                            {"entity_id": mp})
           finally:
               await asyncio.sleep(len(text) * 0.07 + 2)
               for m in mutes:
@@ -576,14 +610,21 @@ class Guardian:
             now = dt.datetime.now().astimezone().strftime("%A %d %B %Y, %H:%M:%S %Z")
             previous = [{k: v for k, v in r.items() if not k.startswith("_")} for r in list(self.history)[:-1]][-6:]
             base = {"ora": now, "richiesta_nuova": visible, "richieste_precedenti": previous,
+                    "gia_segnalato_ultimi_30_minuti": [{"minuti_fa": int((time.time() - t) // 60), "tipo": k, "testo": x[:120]}
+                                                       for t, k, x in self.reported if time.time() - t < REPORT_QUIET_S],
                     "detto_dal_guardiano": [{"secondi_fa": int(time.time() - t), "testo": x}
                                             for t, x in self.spoken if time.time() - t < 600]}
             triage_s = None
             try:
                 ctx_task = asyncio.create_task(self.prefetch())
-                go, digging, why = await self.triage(system, json.dumps(base, ensure_ascii=False))
-                triage_s = round(time.monotonic() - t0, 1)
-                steps.append(["triage", triage_s])
+                if OBVIOUS_FAILURE.search(req.get("reply") or "") or real_errors:
+                    go, digging, why = True, False, "fallimento evidente, senza triage"
+                    triage_s = 0.0
+                    steps.append(["triage saltato", 0.0])
+                else:
+                    go, digging, why = await self.triage(system, json.dumps(base, ensure_ascii=False))
+                    triage_s = round(time.monotonic() - t0, 1)
+                    steps.append(["triage", triage_s])
                 q = (req.get("heard") or "").lower()
                 if any(w in q for w in ("perché", "perche", "come mai", "cosa è successo", "cos'è successo",
                                          "che è successo", "log", "registro", "why", "what happened")):
@@ -592,8 +633,6 @@ class Guardian:
                     hold = random.choice(HOLD_LINES)
                     if self.shadow and not req.get("_test"):
                         acts.append({"would": "speak", "args": {"text": hold}, "note": "frase d'attesa"})
-                    elif req.get("_test"):
-                        await self.run_tool("speak", {"text": hold}, req, acts)
                     else:
                         asyncio.create_task(self.speak(hold, req))
                         acts.append({"did": "speak", "args": {"text": hold}, "note": "frase d'attesa"})
@@ -612,13 +651,36 @@ class Guardian:
             try:
                 for _ in range(MAX_TOOL_TURNS if go else 0):
                     tm = time.monotonic()
-                    resp = await self.claude.messages.create(
-                        model=self.opts.get("model", "claude-sonnet-5-5"), max_tokens=1500,
-                        system=[{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
-                        tools=self.tool_specs(), messages=messages)
+                    early = {}
+                    async with self.claude.messages.stream(
+                            model=self.opts.get("model", "claude-sonnet-5-5"), max_tokens=1500,
+                            system=[{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
+                            tools=self.tool_specs(), messages=messages) as stream:
+                        async for ev in stream:
+                            if ev.type != "content_block_stop":
+                                continue
+                            b = getattr(ev, "content_block", None)
+                            if b is None:
+                                try:
+                                    b = stream.current_message_snapshot.content[ev.index]
+                                except Exception:
+                                    b = None
+                            if b is not None and getattr(b, "type", "") == "tool_use" and b.name == "speak" and b.id not in early:
+                                steps.append(["speak deciso", round(time.monotonic() - t0, 1)])
+                                early[b.id] = asyncio.create_task(self.run_tool("speak", dict(b.input or {}), req, acts))
+                        resp = await stream.get_final_message()
                     steps.append(["modello", round(time.monotonic() - tm, 1), resp.usage.input_tokens,
                                   getattr(resp.usage, "cache_read_input_tokens", 0), resp.usage.output_tokens])
                     messages.append({"role": "assistant", "content": resp.content})
+                    blocks = []
+                    for b in resp.content:
+                        if b.type == "text":
+                            blocks.append({"testo": b.text})
+                        elif b.type == "tool_use":
+                            blocks.append({"strumento": b.name, "argomenti": b.input})
+                        else:
+                            blocks.append({"tipo": b.type})
+                    log("raw", json.dumps({"out_tokens": resp.usage.output_tokens, "blocchi": blocks}, ensure_ascii=False))
                     uses = [b for b in resp.content if b.type == "tool_use"]
                     final = " ".join(b.text for b in resp.content if b.type == "text").strip()
                     if not uses:
@@ -626,16 +688,26 @@ class Guardian:
                     results = []
                     for u in uses:
                         tt = time.monotonic()
-                        out = await self.run_tool(u.name, u.input or {}, req, acts)
+                        if u.id in early:
+                            out = await early[u.id]
+                        else:
+                            out = await self.run_tool(u.name, u.input or {}, req, acts)
                         steps.append(["tool " + u.name, round(time.monotonic() - tt, 1), len(out)])
                         results.append({"type": "tool_result", "tool_use_id": u.id, "content": out})
+                    spoken = [u for u in uses if u.name == "speak"]
+                    if spoken:
+                        # no extra model call for a closing note: the record is written here
+                        others = [u.name for u in uses if u.name != "speak"]
+                        final = "Detto: %s%s" % ((spoken[-1].input or {}).get("text", ""),
+                                                 (" | anche: " + ", ".join(others)) if others else "")
+                        break
                     messages.append({"role": "user", "content": results})
             except Exception as e:
                 final = "errore del guardiano: %s" % e
                 traceback.print_exc()
             secs = round(time.monotonic() - t0, 1)
-            entry = {"at": dt.datetime.now().astimezone().isoformat(timespec="seconds"), "secs": secs,
-                     "shadow": self.shadow, "test": bool(req.get("_test")), "triage_s": triage_s, "steps": steps, "request": visible, "actions": acts, "verdict": final}
+            entry = {"at": dt.datetime.now().astimezone().isoformat(timespec="seconds"), "secs": secs, "test": bool(req.get("_test")),
+                     "shadow": self.shadow, "triage_s": triage_s, "steps": steps, "request": visible, "actions": acts, "verdict": final}
             log("steps", json.dumps(steps))
             log("decision %.1fs (triage %ss) heard=%r actions=%s verdict=%s" % (secs, triage_s, req.get("heard"), acts, final[:200]))
             try:

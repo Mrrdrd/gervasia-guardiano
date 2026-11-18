@@ -1,5 +1,5 @@
 name: Gervàsia guardiano
-version: "0.9.3"
+version: "0.9.4"
 slug: gervasia_guardiano
 description: >-
   Watches every voice request handled by the fast assistant and asks a Claude
