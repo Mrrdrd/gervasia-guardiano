@@ -242,6 +242,10 @@ class Guardian:
                 self.history.append(summary)
                 asyncio.create_task(self.decide(summary))
 
+    def test_mode(self):
+        """A file named "test" next to the instructions makes typed requests count as spoken (silent tests)."""
+        return os.path.exists(os.path.join(os.path.dirname(self.opts["instructions_file"]), "test"))
+
     @staticmethod
     def heard_text(events):
         for e in events:
@@ -323,10 +327,11 @@ class Guardian:
             "time": run.get("timestamp"),
             "assistant": pipeline.get("name"),
             "pipeline_id": pipeline.get("id"),
-            "satellite_id": ((rs or {}).get("data") or {}).get("satellite_id"),
+            "satellite_id": ((rs or {}).get("data") or {}).get("satellite_id")
+                            or (self.settings().get("default_satellite") if typed and self.test_mode() else None),
             "conversation_id": ((rs or {}).get("data") or {}).get("conversation_id"),
             "heard": heard,
-            "typed_not_spoken": typed,
+            "typed_not_spoken": typed and not self.test_mode(),
             "reply": reply,
             "continue_conversation": cont,
             "tool_calls": tools,

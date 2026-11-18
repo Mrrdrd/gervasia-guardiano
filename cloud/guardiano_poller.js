@@ -201,7 +201,7 @@
       setTimeout(() => {
         const off = MICS.filter((m, i) => before[i] !== 'on');
         if (off.length) H().callService('switch', 'turn_off', {}, { entity_id: off });
-      }, text.length * 70 + 2000);
+      }, text.length * 80 + 4000);
     }
     return 'detto (' + how + ')';
   };
