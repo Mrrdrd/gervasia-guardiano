@@ -14,10 +14,12 @@
    Version 7: __G.mon returns at most about 900 characters (the javascript tool cuts longer results, which lost
    events and made runs re-read and repeat them); long events are trimmed (truncated: true), the rest stays queued.
    Version 8, closer to the add-on: voice events carry failed: true when her reply is an obvious failure ("non posso",
-   "non riesco", errors...), and __G.q holds one-line read helpers so a run reads the house in one short call. */
+   "non riesco", errors...), and __G.q holds one-line read helpers so a run reads the house in one short call.
+   Version 9: helpers return at most 450 characters, so one read plus its answer stays under the tool's cut, and
+   __G.again() returns the last batch __G.mon delivered, for a run that lost it to a cut result (no 30 s wait). */
 (function () {
-  if (window.__G && window.__G.v === 8) return;
-  const G = (window.__G = { v: 8 });
+  if (window.__G && window.__G.v === 9) return;
+  const G = (window.__G = { v: 9 });
   const H = () => document.querySelector('home-assistant').hass;
   const WS = (msg) => H().connection.sendMessagePromise(msg);
   const NY = (t) => new Date(t).toLocaleTimeString('it-IT', { timeZone: 'America/New_York', hour12: false });
@@ -250,6 +252,7 @@
         batch.push(e); size += len; G.queue.shift();
       }
       G.sandbox = !!G.opts.testOnly || isT(first);
+      if (batch.length) G.lastBatch = { t: Date.now(), batch };
       res(JSON.stringify(batch));
     };
     if (G.queue.length) return out();
@@ -257,6 +260,8 @@
     G.waiters.push(() => { clearTimeout(t); setTimeout(out, 300); });
   });
   window.__mon = G.mon;
+  /* The last batch __G.mon returned (and how many seconds ago), for a run whose result was cut. */
+  G.again = () => (G.lastBatch ? JSON.stringify({ seconds_ago: Math.round((Date.now() - G.lastBatch.t) / 1000), events: G.lastBatch.batch }) : '[]');
 
   /* ---------- speaking ----------
      G.say(text, voiceEvent): speaks as Gervàsia from where the request came, after her reply has finished,
@@ -298,7 +303,7 @@
   };
 
   /* ---------- read helpers: each returns one short string (under 850 characters, cleaned of ? & =) ---------- */
-  const cut = (s) => clean(s, 850);
+  const cut = (s) => clean(s, 450);
   const nm = (id) => { const s = H().states[id]; return (s && s.attributes.friendly_name) || id; };
   const hm = (t) => new Date(t).toLocaleTimeString('it-IT', { timeZone: 'America/New_York', hour12: false }).slice(0, 5);
   G.q = {
