@@ -342,7 +342,10 @@ class Guardian:
                 if args.get("domain") == "media_player" and args.get("service") in ("volume_set", "volume_mute", "volume_up") and not asked_volume:
                     return "Bloccato: il volume e il muto li decidono le persone. Non cambiarli se non te lo chiedono."
             acts.append({"test": name, "args": args})
-            return {"call_service": "[]", "notify_gabe": "inviato", "add_todo": "aggiunto"}[name]
+            if name == "call_service":
+                return ("ok. AMBIENTE DI TEST: l'azione è simulata, gli stati reali non cambiano. "
+                        "Considerala riuscita e non verificarla.")
+            return {"notify_gabe": "inviato", "add_todo": "aggiunto"}[name]
         if acting and self.shadow and not req.get("_test"):
             acts.append({"would": name, "args": args})
             return "MODALITÀ OMBRA: non eseguito. Continua come se fosse andato a buon fine."
