@@ -9,10 +9,11 @@
    Version 5: dedicated test runs. __G.init({runId, share: false, testOnly: true, out: 'input_text.x'}) sees only test voice
    events, keeps the sandbox always on, writes to its own helper, marks localStorage guardiano_test_ready = runId when
    ready and returns {kind: "end"} from __G.mon once localStorage guardiano_test_end equals its runId. Production runs
-   (testOnly false) now ignore test requests entirely. */
+   (testOnly false) now ignore test requests entirely.
+   Version 6: test runs poll every 0.5 s, as a live run does while a satellite is active. */
 (function () {
-  if (window.__G && window.__G.v === 5) return;
-  const G = (window.__G = { v: 5 });
+  if (window.__G && window.__G.v === 6) return;
+  const G = (window.__G = { v: 6 });
   const H = () => document.querySelector('home-assistant').hass;
   const WS = (msg) => H().connection.sendMessagePromise(msg);
   const NY = (t) => new Date(t).toLocaleTimeString('it-IT', { timeZone: 'America/New_York', hour12: false });
@@ -195,7 +196,8 @@
         } else if (Date.now() - lastMA > 60000) { lastMA = Date.now(); await pollMusicAssistant(); }
         G.errors = 0;
       } catch (e) { G.errors++; if (G.errors === 5) push({ kind: 'poller_error', error: clean(e && e.message, 200) }); }
-      await new Promise((r) => setTimeout(r, Date.now() < G.hotUntil ? 500 : 5000));
+      // a test run polls fast all the time: typed tests move no satellite, which is what makes a live run poll fast
+      await new Promise((r) => setTimeout(r, (G.opts.testOnly || Date.now() < G.hotUntil) ? 500 : 5000));
     }
   }
 
