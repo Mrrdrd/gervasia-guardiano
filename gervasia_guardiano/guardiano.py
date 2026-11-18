@@ -38,13 +38,6 @@ HOT_WINDOW_S = 25
 HOT_POLL_S = 0.5
 IDLE_POLL_S = 5
 MAX_TOOL_TURNS = 10
-READ_TOOLS = {"get_states", "get_history", "get_logbook", "get_traces", "reconstruct"}
-PREP_RULES = ("\n\nPREPARATION. Gervàsia is answering this request right now and you do not see her reply yet. "
-              "Prepare the one or two short Italian sentences you would speak, as Gervàsia, if her reply turns out "
-              "useless or wrong: open with the comic handoff line of 3.3, then the real answer. Use the read tools only "
-              "if the context is not enough. If the request needs an action in the house (turning something on, "
-              "playing something) rather than an answer, or it is chatter not meant for her, reply exactly NESSUNA. "
-              "Reply with only the sentences, nothing else.")
 REPORT_QUIET_S = 30 * 60
 HOLD_LINES = ["Un attimo, controllo.", "Aspetta, do un'occhiata.", "Un secondo, verifico.",
               "Fammi controllare un attimo.", "Dammi un momento, guardo."]
@@ -57,24 +50,6 @@ def log(*a):
 def load_options():
     with open(OPTIONS_PATH, encoding="utf-8") as f:
         return json.load(f)
-
-
-def hhmmss(w):
-    if isinstance(w, (int, float)):
-        return dt.datetime.fromtimestamp(w).astimezone().strftime("%H:%M:%S")
-    return str(w or "")[11:19]
-
-
-def compact_logbook(rows, limit):
-    """Logbook rows as short tuples: time, entity, new state or message, cause."""
-    out = []
-    for r in rows:
-        e = str(r.get("entity_id") or r.get("domain") or "")
-        if e.startswith(("sensor.", "binary_sensor.", "assist_satellite.", "update.", "sun.")):
-            continue
-        cause = "persona" if r.get("context_user_id") else (r.get("context_entity_id") or r.get("context_event_type") or "")
-        out.append([hhmmss(r.get("when")), e, (r.get("state") or r.get("message") or "")[:60], cause])
-    return out[-limit:]
 
 
 def short(v, n=4000):
@@ -178,7 +153,6 @@ class Guardian:
         self.lock = asyncio.Lock()
         self.speak_lock = asyncio.Lock()
         self.users = {}
-        self.preps = {}   # pipeline_run_id -> task preparing an answer while Gervàsia is still answering
         self.reported = collections.deque(maxlen=30)   # (time, kind, text) alerts and to-dos already raised
         self.shadow = bool(opts.get("shadow_mode", True))
 
@@ -223,75 +197,17 @@ class Guardian:
                 ev = det.get("events", [])
                 types = [e["type"] for e in ev]
                 if "intent-end" not in types and "error" not in types and "run-end" not in types:
-                    if rid not in self.preps:
-                        heard = self.heard_text(ev)
-                        if heard:
-                            self.preps[rid] = asyncio.create_task(self.prepare(heard, p))
                     continue   # still running, look again later
                 self.seen.add(rid)
                 summary = self.summarise(p, run, ev)
                 if summary is None:
-                    task = self.preps.pop(rid, None)
-                    if task:
-                        task.cancel()
                     continue
-                summary["_rid"] = rid
-                if rid not in self.preps and summary.get("heard"):
-                    # the run finished between two polls: start preparing now
-                    self.preps[rid] = asyncio.create_task(self.prepare(summary["heard"], p))
                 self.history.append(summary)
                 asyncio.create_task(self.decide(summary))
 
     def test_mode(self):
         """A file named "test" next to the instructions makes typed requests count as spoken (silent tests)."""
         return os.path.exists(os.path.join(os.path.dirname(self.opts["instructions_file"]), "test"))
-
-    @staticmethod
-    def heard_text(events):
-        for e in events:
-            if e["type"] == "stt-end":
-                return ((e.get("data") or {}).get("stt_output") or {}).get("text", "")
-        for e in events:
-            if e["type"] == "intent-start":
-                return (e.get("data") or {}).get("intent_input", "") or ""
-        return ""
-
-    async def prepare(self, heard, pipeline):
-        """While Gervàsia is answering, prepare what the guardian would say if she fails."""
-        t0 = time.monotonic()
-        system = self.instructions() + PREP_RULES
-        previous = [{k: v for k, v in r.items() if not k.startswith("_")} for r in list(self.history)][-10:]
-        try:
-            ctx = await self.prefetch()
-            messages = [{"role": "user", "content": json.dumps({
-                "ora": dt.datetime.now().astimezone().strftime("%A %d %B %Y, %H:%M:%S %Z"),
-                "richiesta_in_corso": heard, "assistente": pipeline.get("name"),
-                "richieste_precedenti": previous, "contesto_casa": ctx}, ensure_ascii=False, default=str)}]
-            read_tools = [t for t in self.tool_specs() if t["name"] in READ_TOOLS]
-            draft = ""
-            for _ in range(5):
-                resp = await self.claude.messages.create(
-                    model=self.opts.get("model", "claude-sonnet-5-5"), max_tokens=600,
-                    system=[{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
-                    tools=read_tools, messages=messages)
-                messages.append({"role": "assistant", "content": resp.content})
-                uses = [b for b in resp.content if b.type == "tool_use"]
-                draft = " ".join(b.text for b in resp.content if b.type == "text").strip()
-                if not uses:
-                    break
-                results = []
-                for u in uses:
-                    out = await self.run_tool(u.name, u.input or {}, {}, []) if u.name in READ_TOOLS else "non disponibile"
-                    results.append({"type": "tool_result", "tool_use_id": u.id, "content": out})
-                messages.append({"role": "user", "content": results})
-            if not draft or draft.upper().startswith("NESSUNA"):
-                draft = ""
-            return {"draft": draft, "secs": round(time.monotonic() - t0, 1)}
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            log("prepare error", e)
-            return {"draft": "", "secs": round(time.monotonic() - t0, 1), "error": str(e)}
 
     def summarise(self, pipeline, run, events):
         get = lambda t: next((e for e in events if e["type"] == t), None)
@@ -368,9 +284,11 @@ class Guardian:
              "input_schema": {"type": "object", "properties": {
                  "entity_ids": {"type": "array", "items": {"type": "string"}},
                  "minutes": {"type": "integer"}}, "required": ["entity_ids"]}},
-            {"name": "get_logbook", "description": "Logbook further back than the 10 minutes you already have (minutes must be more than 10), optionally for one entity. For one or a few entities prefer reconstruct.",
+            {"name": "get_logbook", "description": "Logbook of the last N minutes (what changed and what triggered it), optionally for one entity.",
              "input_schema": {"type": "object", "properties": {
                  "minutes": {"type": "integer"}, "entity_id": {"type": "string"}}}},
+            {"name": "get_system_log", "description": "Recent warnings and errors from the Home Assistant system log.",
+             "input_schema": {"type": "object", "properties": {}}},
             {"name": "get_traces", "description": "Recent run traces of a script or automation (domain script or automation, item_id without the domain).",
              "input_schema": {"type": "object", "properties": {
                  "domain": {"type": "string", "enum": ["script", "automation"]},
@@ -379,6 +297,8 @@ class Guardian:
              "input_schema": {"type": "object", "properties": {
                  "entity_ids": {"type": "array", "items": {"type": "string"}},
                  "minutes": {"type": "integer"}}, "required": ["entity_ids"]}},
+            {"name": "get_recent_requests", "description": "The last voice requests seen (heard text, reply, tools Gervàsia called).",
+             "input_schema": {"type": "object", "properties": {}}},
             {"name": "call_service", "description": "Call a Home Assistant action (service). Some domains are blocked.",
              "input_schema": {"type": "object", "properties": {
                  "domain": {"type": "string"}, "service": {"type": "string"},
@@ -422,20 +342,19 @@ class Guardian:
                 res = await self.ha.call({"type": "history/history_during_period", "start_time": start,
                                           "entity_ids": args["entity_ids"], "minimal_response": True,
                                           "no_attributes": True})
-                return short(res, 3000)
-            if name == "get_logbook" and int(args.get("minutes", 10)) <= 10 and not args.get("entity_id"):
-                return "Hai già il logbook degli ultimi 10 minuti in contesto_casa: usalo."
+                return short(res, 6000)
             if name == "get_logbook":
                 start = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=args.get("minutes", 10))).isoformat()
                 q = {"type": "logbook/get_events", "start_time": start}
                 if args.get("entity_id"):
                     q["entity_ids"] = [args["entity_id"]]
                 res = await self.ha.call(q)
-                return short(compact_logbook(res, 80), 3500)
+                res = [r for r in res if not str(r.get("entity_id", "")).startswith("sensor.")][-150:]
+                return short(res, 8000)
             if name == "get_system_log":
                 res = await self.ha.call({"type": "system_log/list"})
-                return short([[r.get("level"), r.get("name"), str(r.get("message"))[:160], r.get("count"),
-                               hhmmss(r.get("timestamp"))] for r in res[:25]], 3000)
+                return short([{"level": r.get("level"), "name": r.get("name"), "message": r.get("message"),
+                               "count": r.get("count"), "last": r.get("timestamp")} for r in res[:40]], 6000)
             if name == "get_traces":
                 lst = await self.ha.call({"type": "trace/list", "domain": args["domain"], "item_id": args["item_id"]})
                 lst = sorted(lst, key=lambda t: t.get("timestamp", {}).get("start", ""))[-args.get("count", 3):]
@@ -540,7 +459,7 @@ class Guardian:
                 out["_volumi"] = vols
         except Exception:
             pass
-        return short(out, 5000)
+        return short(out, 9000)
 
     async def tts_url(self, text, req):
         p = self.pipelines.get(req.get("pipeline_id")) or next(
@@ -606,42 +525,26 @@ class Guardian:
                 a = st.get("attributes", {})
                 states[e] = {"state": st["state"], "changed": st.get("last_changed", "")[11:19],
                              **{k: a[k] for k in ("volume_level", "is_volume_muted", "media_title", "media_artist") if k in a}}
-        start = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=10)).isoformat()
-        out = {"stati": states}
+        start = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=5)).isoformat()
         try:
             lb = await self.ha.call({"type": "logbook/get_events", "start_time": start})
-            out["logbook_10_minuti [ora, entità, stato, causa]"] = compact_logbook(lb, 60)
+            lb = [{"t": str(r.get("when", ""))[11:19] if isinstance(r.get("when"), str) else r.get("when"),
+                   "e": r.get("entity_id"), "s": r.get("state") or r.get("message"),
+                   "by_person": bool(r.get("context_user_id"))}
+                  for r in lb if not str(r.get("entity_id", "")).startswith(("sensor.", "binary_sensor.", "assist_satellite."))][-60:]
         except Exception as e:
-            out["logbook_10_minuti"] = "errore %s" % e
-        try:
-            sl = await self.ha.call({"type": "system_log/list"})
-            cutoff = time.time() - 3600
-            out["system_log_ultima_ora [livello, fonte, messaggio, volte, ora]"] = [
-                [r.get("level"), r.get("name"), str(r.get("message"))[:140], r.get("count"), hhmmss(r.get("timestamp"))]
-                for r in sl if (r.get("timestamp") or 0) > cutoff][:12]
-        except Exception as e:
-            out["system_log_ultima_ora"] = "errore %s" % e
-        todo = cfg.get("todo_list")
-        if todo:
-            try:
-                res = await self.ha.call({"type": "call_service", "domain": "todo", "service": "get_items",
-                                          "target": {"entity_id": todo}, "return_response": True})
-                items = (res.get("response") or {}).get(todo, {}).get("items", [])
-                out["lista_da_sistemare"] = [i.get("summary") for i in items if i.get("status") != "completed"][:15]
-            except Exception as e:
-                out["lista_da_sistemare"] = "errore %s" % e
-        return out
+            lb = "errore %s" % e
+        return {"stati": states, "logbook_5_minuti": lb}
 
     async def triage(self, system, payload):
         model = self.opts.get("triage_model", "claude-haiku-5-5")
         if not model:
-            return True, False, True, "nessun triage"
+            return True, False, "nessun triage"
         prompt = system + ("\n\nTRIAGE. Do not act now. Decide only whether this request needs the guardian: "
                            "a failure, a useless or 'cannot' answer, a question about the house system, a request "
                            "addressed to you, or a confirmation of a question you asked. When unsure, say yes. "
                            "Set indagine true when answering needs digging into history or logs (why something happened, what went wrong). "
-                           "Set azione true when fixing it needs doing something in the house, not just giving an answer. "
-                           "Answer with only a JSON object: {\"intervieni\": true or false, \"indagine\": true or false, \"azione\": true or false, \"motivo\": \"few words\"}.")
+                           "Answer with only a JSON object: {\"intervieni\": true or false, \"indagine\": true or false, \"motivo\": \"few words\"}.")
         resp = await self.claude.messages.create(
             model=model, max_tokens=120,
             system=[{"type": "text", "text": prompt, "cache_control": {"type": "ephemeral"}}],
@@ -649,10 +552,9 @@ class Guardian:
         txt = " ".join(b.text for b in resp.content if b.type == "text")
         try:
             js = json.loads(txt[txt.index("{"):txt.rindex("}") + 1])
-            return (bool(js.get("intervieni", True)), bool(js.get("indagine", False)),
-                    bool(js.get("azione", True)), str(js.get("motivo", "")))
+            return bool(js.get("intervieni", True)), bool(js.get("indagine", False)), str(js.get("motivo", ""))
         except Exception:
-            return True, False, True, "triage illeggibile: " + txt[:100]
+            return True, False, "triage illeggibile: " + txt[:100]
 
     async def decide(self, req):
         async with self.lock:
@@ -671,7 +573,7 @@ class Guardian:
                 system += ("\n\nMODALITÀ OMBRA ATTIVA: le azioni non vengono eseguite, vengono solo registrate. "
                            "Comportati esattamente come faresti davvero.")
             now = dt.datetime.now().astimezone().strftime("%A %d %B %Y, %H:%M:%S %Z")
-            previous = [{k: v for k, v in r.items() if not k.startswith("_")} for r in list(self.history)[:-1]][-10:]
+            previous = [{k: v for k, v in r.items() if not k.startswith("_")} for r in list(self.history)[:-1]][-6:]
             base = {"ora": now, "richiesta_nuova": visible, "richieste_precedenti": previous,
                     "gia_segnalato_ultimi_30_minuti": [{"minuti_fa": int((time.time() - t) // 60), "tipo": k, "testo": x[:120]}
                                                        for t, k, x in self.reported if time.time() - t < REPORT_QUIET_S],
@@ -680,13 +582,9 @@ class Guardian:
             triage_s = None
             try:
                 ctx_task = asyncio.create_task(self.prefetch())
-                go, digging, needs_action, why = await self.triage(system, json.dumps(base, ensure_ascii=False))
+                go, digging, why = await self.triage(system, json.dumps(base, ensure_ascii=False))
                 triage_s = round(time.monotonic() - t0, 1)
                 steps.append(["triage", triage_s])
-                prep = self.preps.pop(req.get("_rid"), None)
-                if go and prep and not needs_action:
-                    if not prep.done():
-                        digging = True   # the prepared answer is not ready yet: say a holding line first
                 q = (req.get("heard") or "").lower()
                 if any(w in q for w in ("perché", "perche", "come mai", "cosa è successo", "cos'è successo",
                                          "che è successo", "log", "registro", "why", "what happened")):
@@ -699,28 +597,7 @@ class Guardian:
                         asyncio.create_task(self.speak(hold, req))
                         acts.append({"did": "speak", "args": {"text": hold}, "note": "frase d'attesa"})
                     base["frase_di_attesa_gia_detta"] = hold
-                ready = None
-                if go and prep and not needs_action:
-                    tw = time.monotonic()
-                    try:
-                        ready = await asyncio.wait_for(prep, 25)
-                    except Exception:
-                        ready = None
-                    steps.append(["attesa bozza", round(time.monotonic() - tw, 1)])
-                elif prep:
-                    prep.cancel()
-                if ready and ready.get("draft"):
-                    ctx_task.cancel()
-                    go = False
-                    draft = ready["draft"]
-                    steps.append(["bozza pronta dopo", ready.get("secs")])
-                    if self.shadow:
-                        acts.append({"would": "speak", "args": {"text": draft}, "note": "risposta preparata"})
-                    else:
-                        await self.speak(draft, req)
-                        acts.append({"did": "speak", "args": {"text": draft}, "note": "risposta preparata"})
-                    final = "risposta preparata in anticipo (%s)" % why
-                elif not go:
+                if not go:
                     ctx_task.cancel()
                     final = "triage: nessun intervento (%s)" % why
                 else:
@@ -733,16 +610,6 @@ class Guardian:
             messages = [{"role": "user", "content": json.dumps(base, ensure_ascii=False, default=str)}]
             try:
                 for _ in range(MAX_TOOL_TURNS if go else 0):
-                    for m in messages:
-                        if isinstance(m["content"], list):
-                            for b in m["content"]:
-                                if isinstance(b, dict):
-                                    b.pop("cache_control", None)
-                    last = messages[-1]
-                    if isinstance(last["content"], str):
-                        last["content"] = [{"type": "text", "text": last["content"]}]
-                    if isinstance(last["content"][-1], dict):
-                        last["content"][-1]["cache_control"] = {"type": "ephemeral"}
                     tm = time.monotonic()
                     resp = await self.claude.messages.create(
                         model=self.opts.get("model", "claude-sonnet-5-5"), max_tokens=1500,
