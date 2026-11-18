@@ -10,10 +10,12 @@
    events, keeps the sandbox always on, writes to its own helper, marks localStorage guardiano_test_ready = runId when
    ready and returns {kind: "end"} from __G.mon once localStorage guardiano_test_end equals its runId. Production runs
    (testOnly false) now ignore test requests entirely.
-   Version 6: test runs poll every 0.5 s, as a live run does while a satellite is active. */
+   Version 6: test runs poll every 0.5 s, as a live run does while a satellite is active.
+   Version 7: __G.mon returns at most about 900 characters (the javascript tool cuts longer results, which lost
+   events and made runs re-read and repeat them); long events are trimmed (truncated: true), the rest stays queued. */
 (function () {
-  if (window.__G && window.__G.v === 6) return;
-  const G = (window.__G = { v: 6 });
+  if (window.__G && window.__G.v === 7) return;
+  const G = (window.__G = { v: 7 });
   const H = () => document.querySelector('home-assistant').hass;
   const WS = (msg) => H().connection.sendMessagePromise(msg);
   const NY = (t) => new Date(t).toLocaleTimeString('it-IT', { timeZone: 'America/New_York', hour12: false });
@@ -225,9 +227,24 @@
       // test events and real events never share a batch, so the sandbox covers exactly the test ones
       const first = G.queue[0];
       const isT = (e) => !!(e && e.test);
-      let n = 0;
-      while (n < G.queue.length && isT(G.queue[n]) === isT(first)) n++;
-      const batch = G.queue.splice(0, n);
+      // the javascript tool cuts results at about 1000 characters: return only what fits, the rest stays queued
+      const LIMIT = 900;
+      const fit = (e) => {
+        let j = JSON.stringify(e);
+        if (j.length <= LIMIT) return e;
+        const c = Object.assign({}, e, { tools: (e.tools || []).slice(-3).map((t) => String(t).slice(0, 120)), truncated: true });
+        if (JSON.stringify(c).length > LIMIT) c.reply = String(c.reply || '').slice(0, 250);
+        if (JSON.stringify(c).length > LIMIT) c.tools = (c.tools || []).slice(-1).map((t) => String(t).slice(0, 80));
+        return c;
+      };
+      const batch = [];
+      let size = 2;
+      while (G.queue.length && isT(G.queue[0]) === isT(first)) {
+        const e = fit(G.queue[0]);
+        const len = JSON.stringify(e).length + 1;
+        if (batch.length && size + len > LIMIT) break;
+        batch.push(e); size += len; G.queue.shift();
+      }
       G.sandbox = !!G.opts.testOnly || isT(first);
       res(JSON.stringify(batch));
     };
