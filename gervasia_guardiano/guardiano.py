@@ -16,6 +16,7 @@ import datetime as dt
 import json
 import os
 import random
+import re
 import time
 import traceback
 
@@ -38,6 +39,8 @@ HOT_WINDOW_S = 25
 HOT_POLL_S = 0.5
 IDLE_POLL_S = 5
 MAX_TOOL_TURNS = 10
+OBVIOUS_FAILURE = re.compile(r"non posso|non riesco|non ho accesso|non ho (?:uno |gli |lo |un )?strument|non trovo|"
+                             r"non è possibile|non sono in grado|insufficient funds|si è verificato un errore", re.I)
 REPORT_QUIET_S = 30 * 60
 HOLD_LINES = ["Un attimo, controllo.", "Aspetta, do un'occhiata.", "Un secondo, verifico.",
               "Fammi controllare un attimo.", "Dammi un momento, guardo."]
@@ -582,9 +585,14 @@ class Guardian:
             triage_s = None
             try:
                 ctx_task = asyncio.create_task(self.prefetch())
-                go, digging, why = await self.triage(system, json.dumps(base, ensure_ascii=False))
-                triage_s = round(time.monotonic() - t0, 1)
-                steps.append(["triage", triage_s])
+                if OBVIOUS_FAILURE.search(req.get("reply") or "") or real_errors:
+                    go, digging, why = True, False, "fallimento evidente, senza triage"
+                    triage_s = 0.0
+                    steps.append(["triage saltato", 0.0])
+                else:
+                    go, digging, why = await self.triage(system, json.dumps(base, ensure_ascii=False))
+                    triage_s = round(time.monotonic() - t0, 1)
+                    steps.append(["triage", triage_s])
                 q = (req.get("heard") or "").lower()
                 if any(w in q for w in ("perché", "perche", "come mai", "cosa è successo", "cos'è successo",
                                          "che è successo", "log", "registro", "why", "what happened")):
@@ -611,10 +619,24 @@ class Guardian:
             try:
                 for _ in range(MAX_TOOL_TURNS if go else 0):
                     tm = time.monotonic()
-                    resp = await self.claude.messages.create(
-                        model=self.opts.get("model", "claude-sonnet-5-5"), max_tokens=1500,
-                        system=[{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
-                        tools=self.tool_specs(), messages=messages)
+                    early = {}
+                    async with self.claude.messages.stream(
+                            model=self.opts.get("model", "claude-sonnet-5-5"), max_tokens=1500,
+                            system=[{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
+                            tools=self.tool_specs(), messages=messages) as stream:
+                        async for ev in stream:
+                            if ev.type != "content_block_stop":
+                                continue
+                            b = getattr(ev, "content_block", None)
+                            if b is None:
+                                try:
+                                    b = stream.current_message_snapshot.content[ev.index]
+                                except Exception:
+                                    b = None
+                            if b is not None and getattr(b, "type", "") == "tool_use" and b.name == "speak" and b.id not in early:
+                                steps.append(["speak deciso", round(time.monotonic() - t0, 1)])
+                                early[b.id] = asyncio.create_task(self.run_tool("speak", dict(b.input or {}), req, acts))
+                        resp = await stream.get_final_message()
                     steps.append(["modello", round(time.monotonic() - tm, 1), resp.usage.input_tokens,
                                   getattr(resp.usage, "cache_read_input_tokens", 0), resp.usage.output_tokens])
                     messages.append({"role": "assistant", "content": resp.content})
@@ -634,9 +656,19 @@ class Guardian:
                     results = []
                     for u in uses:
                         tt = time.monotonic()
-                        out = await self.run_tool(u.name, u.input or {}, req, acts)
+                        if u.id in early:
+                            out = await early[u.id]
+                        else:
+                            out = await self.run_tool(u.name, u.input or {}, req, acts)
                         steps.append(["tool " + u.name, round(time.monotonic() - tt, 1), len(out)])
                         results.append({"type": "tool_result", "tool_use_id": u.id, "content": out})
+                    spoken = [u for u in uses if u.name == "speak"]
+                    if spoken:
+                        # no extra model call for a closing note: the record is written here
+                        others = [u.name for u in uses if u.name != "speak"]
+                        final = "Detto: %s%s" % ((spoken[-1].input or {}).get("text", ""),
+                                                 (" | anche: " + ", ".join(others)) if others else "")
+                        break
                     messages.append({"role": "user", "content": results})
             except Exception as e:
                 final = "errore del guardiano: %s" % e
