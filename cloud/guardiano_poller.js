@@ -12,10 +12,12 @@
    (testOnly false) now ignore test requests entirely.
    Version 6: test runs poll every 0.5 s, as a live run does while a satellite is active.
    Version 7: __G.mon returns at most about 900 characters (the javascript tool cuts longer results, which lost
-   events and made runs re-read and repeat them); long events are trimmed (truncated: true), the rest stays queued. */
+   events and made runs re-read and repeat them); long events are trimmed (truncated: true), the rest stays queued.
+   Version 8, closer to the add-on: voice events carry failed: true when her reply is an obvious failure ("non posso",
+   "non riesco", errors...), and __G.q holds one-line read helpers so a run reads the house in one short call. */
 (function () {
-  if (window.__G && window.__G.v === 7) return;
-  const G = (window.__G = { v: 7 });
+  if (window.__G && window.__G.v === 8) return;
+  const G = (window.__G = { v: 8 });
   const H = () => document.querySelector('home-assistant').hass;
   const WS = (msg) => H().connection.sendMessagePromise(msg);
   const NY = (t) => new Date(t).toLocaleTimeString('it-IT', { timeZone: 'America/New_York', hour12: false });
@@ -30,6 +32,7 @@
   const MA_ERR = /ERROR_BUFFERING|ERROR_PLAYBACK_FAILED|disconnected prematurely/;
   const TEST_OUT = 'input_text.guardiano_test_cloud';
   const isTestPipe = (p) => /test/i.test((p && p.name) || '');
+  const OBVIOUS = /non posso|non riesco|non ho accesso|non ho (?:uno |gli |lo |un )?strument|non trovo|non è possibile|non sono in grado|insufficient funds|si è verificato un errore/i;
 
   G.opts = { runId: null, share: true, oldMs: 120000, testOnly: false, out: TEST_OUT };
   G.seen = new Set(); G.prepped = new Set(); G.queue = []; G.waiters = [];
@@ -76,6 +79,7 @@
       satellite: sat, typed, test,
       heard: clean(heard, 300), reply: clean(reply, 500), tools,
       errors: ev.filter((e) => e.type === 'error').map((e) => (e.data && e.data.code) || 'error'),
+      failed: OBVIOUS.test(reply) || ev.some((e) => e.type === 'error' && !['stt-no-text-recognized', 'duplicate_wake_up_detected'].includes(e.data && e.data.code)),
       intentEndMs: ie ? Date.parse(ie.timestamp) : null, replyLen: reply.length,
     };
   }
@@ -291,6 +295,59 @@
       }, text.length * 80 + 4000);
     }
     return 'detto (' + how + ')';
+  };
+
+  /* ---------- read helpers: each returns one short string (under 850 characters, cleaned of ? & =) ---------- */
+  const cut = (s) => clean(s, 850);
+  const nm = (id) => { const s = H().states[id]; return (s && s.attributes.friendly_name) || id; };
+  const hm = (t) => new Date(t).toLocaleTimeString('it-IT', { timeZone: 'America/New_York', hour12: false }).slice(0, 5);
+  G.q = {
+    // system log entries of the last N minutes (default 5)
+    errors: async (min) => {
+      const since = Date.now() / 1000 - 60 * (min || 5);
+      const l = (await WS({ type: 'system_log/list' })).filter((r) => (r.timestamp || 0) >= since);
+      return cut(l.length ? l.map((r) => r.level + ' ' + r.name + ' x' + r.count + ': ' + String(r.message).slice(0, 90)).join(' | ') : 'nessun errore negli ultimi ' + (min || 5) + ' minuti');
+    },
+    // what is on in a domain (default light); groups listed apart so nothing is counted twice
+    on: (domain) => {
+      const all = Object.values(H().states).filter((s) => s.entity_id.startsWith((domain || 'light') + '.') && s.state === 'on');
+      const groups = all.filter((s) => Array.isArray(s.attributes.entity_id));
+      const single = all.filter((s) => !Array.isArray(s.attributes.entity_id) && !/screen|led|ring/i.test(s.entity_id));
+      const leds = all.filter((s) => /screen|led|ring/i.test(s.entity_id));
+      return cut(single.length + ' accese: ' + single.map((s) => s.attributes.friendly_name).join(', ') + (groups.length ? ' | gruppi accesi: ' + groups.map((s) => s.attributes.friendly_name).join(', ') : '') + (leds.length ? ' | spie e schermi (non sono luci): ' + leds.map((s) => s.attributes.friendly_name).join(', ') : ''));
+    },
+    unavailable: () => {
+      const l = Object.values(H().states).filter((s) => s.state === 'unavailable' && !/^(sensor|binary_sensor|button|update|event|number|select)\./.test(s.entity_id));
+      return cut(l.length + ' non disponibili: ' + l.map((s) => s.attributes.friendly_name || s.entity_id).join(', '));
+    },
+    todo: async (id) => {
+      const r = await WS({ type: 'todo/item/list', entity_id: id || 'todo.gervasio_da_sistemare' });
+      const open = (r.items || []).filter((i) => i.status !== 'completed');
+      return cut(open.length + ' aperte: ' + open.map((i) => i.summary).join(' | '));
+    },
+    // minutes on and sessions since local midnight (or the last N hours)
+    onTime: async (id, hours) => {
+      const now = new Date(), start = hours ? new Date(Date.now() - hours * 3600e3) : new Date(now.getFullYear(), now.getMonth(), now.getDate());
+      const h = await WS({ type: 'history/history_during_period', start_time: start.toISOString(), entity_ids: [id], minimal_response: true, no_attributes: true });
+      const l = (h[id] || []).map((x) => ({ s: x.s, t: (x.lu || x.lc) * 1000 }));
+      let mins = 0, sess = [];
+      l.forEach((x, i) => { if (x.s === 'on') { const end = (l[i + 1] && l[i + 1].t) || Date.now(); mins += (end - x.t) / 60000; sess.push(hm(x.t) + '-' + (l[i + 1] ? hm(end) : 'ora')); } });
+      return cut(nm(id) + ': ' + Math.round(mins) + ' minuti accesa in ' + sess.length + ' volte (' + sess.join(', ') + '), ora ' + ((H().states[id] || {}).state));
+    },
+    // logbook of one entity, last N minutes (default 720), with who caused each change
+    log: async (id, min) => {
+      const r = await WS({ type: 'logbook/get_events', start_time: new Date(Date.now() - 60000 * (min || 720)).toISOString(), entity_ids: [id] });
+      return cut(r.slice(-12).map((e) => hm(e.when * 1000) + ' ' + (e.state || e.message) + (e.context_user_id ? ' (persona)' : e.context_entity_id ? ' (da ' + e.context_entity_id + ')' : e.context_event_type ? ' (' + e.context_event_type + ')' : '')).join(' | ') || 'niente nel registro');
+    },
+    traces: async (script, n) => {
+      const l = (await WS({ type: 'trace/list', domain: 'script', item_id: script })).sort((a, b) => (a.timestamp.start < b.timestamp.start ? 1 : -1)).slice(0, n || 2);
+      return cut(l.map((t) => hm(t.timestamp.start) + ' ' + t.state + (t.script_execution ? ' ' + t.script_execution : '') + (t.error ? ' errore: ' + t.error : '') + (t.timestamp.finish ? ' durata ' + Math.round((Date.parse(t.timestamp.finish) - Date.parse(t.timestamp.start)) / 1000) + ' s' : '')).join(' | ') || 'nessuna traccia');
+    },
+    mics: () => cut(MICS.map((m) => nm(m) + ': ' + ((H().states[m] || {}).state === 'on' ? 'microfono MUTO' : 'microfono attivo')).join(' | ')),
+    // compact states with volume and title, for a few entities
+    states: (ids) => cut([].concat(ids).map((id) => { const s = H().states[id]; if (!s) return id + ' non trovato'; const a = s.attributes; return (a.friendly_name || id) + ': ' + s.state + (a.volume_level != null ? ' vol ' + Math.round(a.volume_level * 100) + '%' : '') + (a.is_volume_muted ? ' muto' : '') + (a.media_title ? ' "' + a.media_title + '"' : ''); }).join(' | ')),
+    // find entities by words in the id or name
+    find: (text) => { const w = String(text).toLowerCase(); return cut(Object.values(H().states).filter((s) => (s.entity_id + ' ' + (s.attributes.friendly_name || '')).toLowerCase().includes(w)).slice(0, 15).map((s) => s.entity_id + '=' + s.state).join(' | ')); },
   };
 
   G.stop = () => { G.stopped = true; if (G.unsub) { G.unsub(); G.unsub = null; } };
