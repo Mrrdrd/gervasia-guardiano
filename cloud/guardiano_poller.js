@@ -16,10 +16,12 @@
    Version 8, closer to the add-on: voice events carry failed: true when her reply is an obvious failure ("non posso",
    "non riesco", errors...), and __G.q holds one-line read helpers so a run reads the house in one short call.
    Version 9: helpers return at most 450 characters, so one read plus its answer stays under the tool's cut, and
-   __G.again() returns the last batch __G.mon delivered, for a run that lost it to a cut result (no 30 s wait). */
+   __G.again() returns the last batch __G.mon delivered, for a run that lost it to a cut result (no 30 s wait).
+   Version 10: microphones are muted and restored by script.guardiano_microfoni inside Home Assistant, not by a timer
+   in this page: on Nov 18 the page dropped mid announcement and both microphones stayed muted for an hour. */
 (function () {
-  if (window.__G && window.__G.v === 9) return;
-  const G = (window.__G = { v: 9 });
+  if (window.__G && window.__G.v === 10) return;
+  const G = (window.__G = { v: 10 });
   const H = () => document.querySelector('home-assistant').hass;
   const WS = (msg) => H().connection.sendMessagePromise(msg);
   const NY = (t) => new Date(t).toLocaleTimeString('it-IT', { timeZone: 'America/New_York', hour12: false });
@@ -285,8 +287,13 @@
     const wait = v && v.intentEndMs ? v.intentEndMs + (v.replyLen || 0) * 70 + 1500 - Date.now() : 0;
     const url = await G.tts(text);
     if (wait > 0) await new Promise((r) => setTimeout(r, Math.min(wait, 20000)));
-    const before = MICS.map((m) => (h.states[m] || {}).state);
-    await h.callService('switch', 'turn_on', {}, { entity_id: MICS });
+    // which microphones to switch back on at the end: those that were live before we spoke. While an earlier
+    // announcement is still muting them, keep its list (they read as muted because of us, not of a person).
+    const secs = Math.ceil((text.length * 80 + 4000) / 1000);
+    if (!(G.micUntil > Date.now())) G.micRestore = MICS.filter((m) => (h.states[m] || {}).state !== 'on');
+    G.micUntil = Date.now() + secs * 1000;
+    await h.callService('script', 'turn_on', { variables: { secondi: secs, ripristina: G.micRestore } }, { entity_id: 'script.guardiano_microfoni' });
+    await new Promise((r) => setTimeout(r, 300));
     G.spoken.push({ t: Date.now(), text: text.toLowerCase().replace(/[^\p{L}\p{N} ]/gu, '') });
     let how = '';
     try {
@@ -294,10 +301,7 @@
       else if (cfg.announce) { await h.callService('assist_satellite', 'announce', { message: text, preannounce: false }, { entity_id: sat }); how = 'satellite'; }
       else { await h.callService('media_player', 'play_media', { media_content_id: url, media_content_type: 'music', announce: true }, { entity_id: cfg.mp }); how = 'media_player'; }
     } finally {
-      setTimeout(() => {
-        const off = MICS.filter((m, i) => before[i] !== 'on');
-        if (off.length) H().callService('switch', 'turn_off', {}, { entity_id: off });
-      }, text.length * 80 + 4000);
+      // nothing to do here: script.guardiano_microfoni restores the microphones itself
     }
     return 'detto (' + how + ')';
   };
