@@ -495,10 +495,8 @@ class Guardian:
 
     async def speak(self, text, req):
       if req.get("_test"):
-          # test environment: wait as for real, then "say" it into a helper instead of a speaker
-          wait = len(req.get("reply") or "") * 0.07 + 1.5 - (time.monotonic() - req["_intent_end_monotonic"])
-          if wait > 0:
-              await asyncio.sleep(min(wait, 20))
+          # test environment: "say" it into a helper instead of a speaker, at once, so timings measure the
+          # guardian only (live, it also waits for Gervàsia's reply to finish, the same for every version)
           self.spoken.append((time.time(), text))
           await self.ha.service("input_text", "set_value",
                                 {"value": (dt.datetime.now().strftime("%H:%M:%S ") + text)[:255]},
