@@ -4,10 +4,11 @@
    Version 2, Nov 17 2026: test mode (localStorage guardiano_test = 1 makes typed requests count as spoken to the ReSpeaker).
    Version 3, Nov 18 2026: test environment. Requests on the "Gervàsia Test" pipeline arrive with test: true, in batches of
    their own. While such a batch is being handled (until the next __G.mon call) every action is sandboxed: nothing
-   reaches the house, speech and actions are written to input_text.guardiano_test_cloud instead. */
+   reaches the house, speech and actions are written to input_text.guardiano_test_cloud instead.
+   Version 4: read-only services (get_..., search) really run in the sandbox. */
 (function () {
-  if (window.__G && window.__G.v === 3) return;
-  const G = (window.__G = { v: 3 });
+  if (window.__G && window.__G.v === 4) return;
+  const G = (window.__G = { v: 4 });
   const H = () => document.querySelector('home-assistant').hass;
   const WS = (msg) => H().connection.sendMessagePromise(msg);
   const NY = (t) => new Date(t).toLocaleTimeString('it-IT', { timeZone: 'America/New_York', hour12: false });
@@ -154,7 +155,7 @@
     if (c.__gSandbox) { G.realSend = c.__gRealSend; return; }
     G.realSend = c.__gRealSend = c.sendMessagePromise.bind(c);
     c.sendMessagePromise = (msg) => {
-      if (G.sandbox && msg && msg.type === 'call_service') {
+      if (G.sandbox && msg && msg.type === 'call_service' && !/^(get_|search$)/.test(msg.service || '')) {
         const what = msg.domain + '.' + msg.service + ' ' + JSON.stringify(msg.target || {}) + ' ' + JSON.stringify(msg.service_data || {});
         G.sandboxLog.push({ t: Date.now(), what });
         testWrite('AZIONE ' + what);
@@ -165,7 +166,7 @@
     const realFetch = window.fetch.bind(window);
     window.fetch = (u, o) => {
       const url = String((u && u.url) || u);
-      if (G.sandbox && /\/api\/services\//.test(url) && o && String(o.method || '').toUpperCase() === 'POST') {
+      if (G.sandbox && /\/api\/services\//.test(url) && !/\/api\/services\/[^/]+\/(get_|search)/.test(url) && o && String(o.method || '').toUpperCase() === 'POST') {
         G.sandboxLog.push({ t: Date.now(), what: 'REST ' + url });
         testWrite('AZIONE ' + url.replace(/.*\/api\/services\//, '') + ' ' + String(o.body || '').slice(0, 150));
         return Promise.resolve(new Response('[]', { status: 200, headers: { 'Content-Type': 'application/json' } }));
