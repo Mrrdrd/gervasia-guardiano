@@ -618,6 +618,15 @@ class Guardian:
                     steps.append(["modello", round(time.monotonic() - tm, 1), resp.usage.input_tokens,
                                   getattr(resp.usage, "cache_read_input_tokens", 0), resp.usage.output_tokens])
                     messages.append({"role": "assistant", "content": resp.content})
+                    blocks = []
+                    for b in resp.content:
+                        if b.type == "text":
+                            blocks.append({"testo": b.text})
+                        elif b.type == "tool_use":
+                            blocks.append({"strumento": b.name, "argomenti": b.input})
+                        else:
+                            blocks.append({"tipo": b.type})
+                    log("raw", json.dumps({"out_tokens": resp.usage.output_tokens, "blocchi": blocks}, ensure_ascii=False))
                     uses = [b for b in resp.content if b.type == "tool_use"]
                     final = " ".join(b.text for b in resp.content if b.type == "text").strip()
                     if not uses:
