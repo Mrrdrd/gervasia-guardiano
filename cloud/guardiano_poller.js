@@ -1,10 +1,13 @@
 /* Gervàsia guardiano: watcher and speaker for the cloud guardian runs.
    Load in the Home Assistant tab:  await import('/local/guardiano_poller.js?v=1')  (or a <script> tag)
    Then: await __G.init({runId: <number>})  once, and  await __G.mon(30000)  in a loop.
-   Version 2, Nov 17 2026: test mode (localStorage guardiano_test = 1 makes typed requests count as spoken to the ReSpeaker). */
+   Version 2, Nov 17 2026: test mode (localStorage guardiano_test = 1 makes typed requests count as spoken to the ReSpeaker).
+   Version 3, Nov 18 2026: test environment. Requests on the "Gervàsia Test" pipeline arrive with test: true, in batches of
+   their own. While such a batch is being handled (until the next __G.mon call) every action is sandboxed: nothing
+   reaches the house, speech and actions are written to input_text.guardiano_test_cloud instead. */
 (function () {
-  if (window.__G && window.__G.v === 2) return;
-  const G = (window.__G = { v: 2 });
+  if (window.__G && window.__G.v === 3) return;
+  const G = (window.__G = { v: 3 });
   const H = () => document.querySelector('home-assistant').hass;
   const WS = (msg) => H().connection.sendMessagePromise(msg);
   const NY = (t) => new Date(t).toLocaleTimeString('it-IT', { timeZone: 'America/New_York', hour12: false });
@@ -17,6 +20,8 @@
   const DEFAULT_SAT = 'assist_satellite.respeaker_salotto_assist_satellite';
   const WATCH_SCRIPTS = ['script.guarda_su_pc_worker', 'script.return_to_pc', 'script.esegui_routine_worker', 'script.tv_italia'];
   const MA_ERR = /ERROR_BUFFERING|ERROR_PLAYBACK_FAILED|disconnected prematurely/;
+  const TEST_OUT = 'input_text.guardiano_test_cloud';
+  const isTestPipe = (p) => /test/i.test((p && p.name) || '');
 
   G.opts = { runId: null, share: true, oldMs: 120000 };
   G.seen = new Set(); G.prepped = new Set(); G.queue = []; G.waiters = [];
@@ -53,10 +58,12 @@
       if (d.role === 'tool_result') tools.push('risultato ' + d.tool_name + ': ' + clean(JSON.stringify(d.tool_result), 200));
     });
     let typed = !stt && !!heard, sat = (rs && rs.data && rs.data.satellite_id) || null;
+    const test = isTestPipe(p);
+    if (test && typed) { typed = false; sat = sat || DEFAULT_SAT; }
     try { if (typed && localStorage.getItem('guardiano_test') === '1') { typed = false; sat = DEFAULT_SAT; } } catch (e) {}
     return {
       kind: 'voice', id: run.pipeline_run_id, time: NY(run.timestamp), assistant: p.name,
-      satellite: sat, typed,
+      satellite: sat, typed, test,
       heard: clean(heard, 300), reply: clean(reply, 500), tools,
       errors: ev.filter((e) => e.type === 'error').map((e) => (e.data && e.data.code) || 'error'),
       intentEndMs: ie ? Date.parse(ie.timestamp) : null, replyLen: reply.length,
@@ -135,6 +142,39 @@
     } catch (e) {}
   }
 
+  /* ---------- test sandbox ---------- */
+  G.sandbox = false; G.sandboxLog = [];
+  const ts = () => new Date().toLocaleTimeString('it-IT', { hour12: false });
+  function testWrite(text) {
+    return G.realSend({ type: 'call_service', domain: 'input_text', service: 'set_value',
+      service_data: { value: (ts() + ' ' + text).slice(0, 255) }, target: { entity_id: TEST_OUT } }).catch(() => {});
+  }
+  function installSandbox() {
+    const c = H().connection;
+    if (c.__gSandbox) { G.realSend = c.__gRealSend; return; }
+    G.realSend = c.__gRealSend = c.sendMessagePromise.bind(c);
+    c.sendMessagePromise = (msg) => {
+      if (G.sandbox && msg && msg.type === 'call_service') {
+        const what = msg.domain + '.' + msg.service + ' ' + JSON.stringify(msg.target || {}) + ' ' + JSON.stringify(msg.service_data || {});
+        G.sandboxLog.push({ t: Date.now(), what });
+        testWrite('AZIONE ' + what);
+        return Promise.resolve({ context: { id: 'test' }, response: null });
+      }
+      return G.realSend(msg);
+    };
+    const realFetch = window.fetch.bind(window);
+    window.fetch = (u, o) => {
+      const url = String((u && u.url) || u);
+      if (G.sandbox && /\/api\/services\//.test(url) && o && String(o.method || '').toUpperCase() === 'POST') {
+        G.sandboxLog.push({ t: Date.now(), what: 'REST ' + url });
+        testWrite('AZIONE ' + url.replace(/.*\/api\/services\//, '') + ' ' + String(o.body || '').slice(0, 150));
+        return Promise.resolve(new Response('[]', { status: 200, headers: { 'Content-Type': 'application/json' } }));
+      }
+      return realFetch(u, o);
+    };
+    c.__gSandbox = true;
+  }
+
   /* ---------- main loop ---------- */
   async function loop() {
     let lastMA = 0;
@@ -159,6 +199,7 @@
       const l = await WS({ type: 'assist_pipeline/pipeline_debug/list', pipeline_id: p.id });
       (l.pipeline_runs || []).forEach((r) => { if (Date.now() - Date.parse(r.timestamp) > G.opts.oldMs) G.seen.add(r.pipeline_run_id); });
     }
+    installSandbox();
     if (!G.unsub) G.unsub = await H().connection.subscribeEvents(G.onState, 'state_changed');
     if (!G.looping) { G.looping = true; loop(); }
     return 'pronto: ' + G.pipes.map((p) => p.name).join(', ');
@@ -166,7 +207,17 @@
 
   /* Wait for events: returns a JSON string (cleaned of ? & =), [] after waitMs with nothing new. */
   G.mon = (waitMs) => new Promise((res) => {
-    const out = () => res(JSON.stringify(G.queue.splice(0)));
+    G.sandbox = false; // the previous batch is done
+    const out = () => {
+      // test events and real events never share a batch, so the sandbox covers exactly the test ones
+      const first = G.queue[0];
+      const isT = (e) => !!(e && e.test);
+      let n = 0;
+      while (n < G.queue.length && isT(G.queue[n]) === isT(first)) n++;
+      const batch = G.queue.splice(0, n);
+      G.sandbox = isT(first);
+      res(JSON.stringify(batch));
+    };
     if (G.queue.length) return out();
     const t = setTimeout(out, Math.min(waitMs || 30000, 30000));
     G.waiters.push(() => { clearTimeout(t); setTimeout(out, 300); });
@@ -184,6 +235,13 @@
   };
   G.say = async (text, v) => {
     const h = H();
+    if (G.sandbox || (v && v.test)) {
+      const w = v && v.intentEndMs ? v.intentEndMs + (v.replyLen || 0) * 70 + 1500 - Date.now() : 0;
+      if (w > 0) await new Promise((r) => setTimeout(r, Math.min(w, 20000)));
+      G.spoken.push({ t: Date.now(), text: text.toLowerCase().replace(/[^\p{L}\p{N} ]/gu, '') });
+      await testWrite(text);
+      return 'detto (test)';
+    }
     const sat = (v && v.satellite && SATS[v.satellite]) ? v.satellite : DEFAULT_SAT;
     const cfg = SATS[sat];
     const wait = v && v.intentEndMs ? v.intentEndMs + (v.replyLen || 0) * 70 + 1500 - Date.now() : 0;

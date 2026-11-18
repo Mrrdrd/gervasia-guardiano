@@ -212,6 +212,12 @@ class Guardian:
         """A file named "test" next to the instructions makes typed requests count as spoken (silent tests)."""
         return os.path.exists(os.path.join(os.path.dirname(self.opts["instructions_file"]), "test"))
 
+    @staticmethod
+    def is_test_pipeline(pipeline):
+        """The "Gervàsia Test" pipeline: requests there are handled as if live, but nothing touches the house.
+        Speech goes to input_text.guardiano_test_nuovo, other actions are only recorded."""
+        return "test" in (pipeline.get("name") or "").lower()
+
     def summarise(self, pipeline, run, events):
         get = lambda t: next((e for e in events if e["type"] == t), None)
         rs, stt, ie = get("run-start"), get("stt-end"), get("intent-end")
@@ -219,6 +225,7 @@ class Guardian:
         if errors and all((e or {}).get("code") == "duplicate_wake_up_detected" for e in errors) and not stt:
             return None
         heard = ((stt or {}).get("data") or {}).get("stt_output", {}).get("text", "")
+        is_test = self.is_test_pipeline(pipeline)
         typed = False
         if not heard:
             ist = get("intent-start")
@@ -247,15 +254,16 @@ class Guardian:
             "assistant": pipeline.get("name"),
             "pipeline_id": pipeline.get("id"),
             "satellite_id": ((rs or {}).get("data") or {}).get("satellite_id")
-                            or (self.settings().get("default_satellite") if typed and self.test_mode() else None),
+                            or (self.settings().get("default_satellite") if typed and (is_test or self.test_mode()) else None),
             "conversation_id": ((rs or {}).get("data") or {}).get("conversation_id"),
             "heard": heard,
-            "typed_not_spoken": typed and not self.test_mode(),
+            "typed_not_spoken": typed and not (is_test or self.test_mode()),
             "reply": reply,
             "continue_conversation": cont,
             "tool_calls": tools,
             "errors": errors,
             "_intent_end_monotonic": time.monotonic(),
+            "_test": is_test,
         }
 
     async def watch(self):
@@ -325,7 +333,17 @@ class Guardian:
                 return ("Già segnalato %d minuti fa (\"%s\"): non ripetere la stessa segnalazione. "
                         "Se è un problema davvero diverso, scrivilo solo nella riga finale." % ((now - t) // 60, x[:80]))
             self.reported.append((now, name, args.get("text") or args.get("title") or ""))
-        if acting and self.shadow:
+        if acting and req.get("_test") and name != "speak":
+            if name == "call_service":
+                if args.get("domain") in BLOCKED_DOMAINS:
+                    return "Bloccato: il dominio %s non è permesso al guardiano." % args["domain"]
+                heard = (req.get("heard") or "").lower()
+                asked_volume = any(w in heard for w in ("volume", "alza", "abbassa", "muto", "silenzi", "louder", "quieter", "mute"))
+                if args.get("domain") == "media_player" and args.get("service") in ("volume_set", "volume_mute", "volume_up") and not asked_volume:
+                    return "Bloccato: il volume e il muto li decidono le persone. Non cambiarli se non te lo chiedono."
+            acts.append({"test": name, "args": args})
+            return {"call_service": "[]", "notify_gabe": "inviato", "add_todo": "aggiunto"}[name]
+        if acting and self.shadow and not req.get("_test"):
             acts.append({"would": name, "args": args})
             return "MODALITÀ OMBRA: non eseguito. Continua come se fosse andato a buon fine."
         try:
@@ -473,6 +491,16 @@ class Guardian:
         return js.get("url") if isinstance(js, dict) else None
 
     async def speak(self, text, req):
+      if req.get("_test"):
+          # test environment: wait as for real, then "say" it into a helper instead of a speaker
+          wait = len(req.get("reply") or "") * 0.07 + 1.5 - (time.monotonic() - req["_intent_end_monotonic"])
+          if wait > 0:
+              await asyncio.sleep(min(wait, 20))
+          self.spoken.append((time.time(), text))
+          await self.ha.service("input_text", "set_value",
+                                {"value": (dt.datetime.now().strftime("%H:%M:%S ") + text)[:255]},
+                                {"entity_id": "input_text.guardiano_test_nuovo"})
+          return
       async with self.speak_lock:
           cfg = self.settings()
           sats = cfg.get("satellites", {})
@@ -572,7 +600,7 @@ class Guardian:
                 log("skip: no text and no error")
                 return
             system = self.instructions()
-            if self.shadow:
+            if self.shadow and not req.get("_test"):
                 system += ("\n\nMODALITÀ OMBRA ATTIVA: le azioni non vengono eseguite, vengono solo registrate. "
                            "Comportati esattamente come faresti davvero.")
             now = dt.datetime.now().astimezone().strftime("%A %d %B %Y, %H:%M:%S %Z")
@@ -599,7 +627,7 @@ class Guardian:
                     digging = True
                 if go and digging:
                     hold = random.choice(HOLD_LINES)
-                    if self.shadow:
+                    if self.shadow and not req.get("_test"):
                         acts.append({"would": "speak", "args": {"text": hold}, "note": "frase d'attesa"})
                     else:
                         asyncio.create_task(self.speak(hold, req))
@@ -674,7 +702,7 @@ class Guardian:
                 final = "errore del guardiano: %s" % e
                 traceback.print_exc()
             secs = round(time.monotonic() - t0, 1)
-            entry = {"at": dt.datetime.now().astimezone().isoformat(timespec="seconds"), "secs": secs,
+            entry = {"at": dt.datetime.now().astimezone().isoformat(timespec="seconds"), "secs": secs, "test": bool(req.get("_test")),
                      "shadow": self.shadow, "triage_s": triage_s, "steps": steps, "request": visible, "actions": acts, "verdict": final}
             log("steps", json.dumps(steps))
             log("decision %.1fs (triage %ss) heard=%r actions=%s verdict=%s" % (secs, triage_s, req.get("heard"), acts, final[:200]))
@@ -684,7 +712,7 @@ class Guardian:
                     f.write(json.dumps(entry, ensure_ascii=False, default=str) + "\n")
             except Exception as e:
                 log("log write failed", e)
-            label = ("OMBRA " if self.shadow else "") + ("interviene" if acts else "nessun intervento")
+            label = ("TEST " if req.get("_test") else "OMBRA " if self.shadow else "") + ("interviene" if acts else "nessun intervento")
             await self.ha.rest("POST", "/states/sensor.guardiano_ultima_decisione", {
                 "state": label, "attributes": {
                     "friendly_name": "Guardiano: ultima decisione", "sentito": req.get("heard"),
