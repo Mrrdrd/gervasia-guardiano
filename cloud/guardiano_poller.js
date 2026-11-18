@@ -308,13 +308,24 @@
       const l = (await WS({ type: 'system_log/list' })).filter((r) => (r.timestamp || 0) >= since);
       return cut(l.length ? l.map((r) => r.level + ' ' + r.name + ' x' + r.count + ': ' + String(r.message).slice(0, 90)).join(' | ') : 'nessun errore negli ultimi ' + (min || 5) + ' minuti');
     },
-    // what is on in a domain (default light); groups listed apart so nothing is counted twice
-    on: (domain) => {
-      const all = Object.values(H().states).filter((s) => s.entity_id.startsWith((domain || 'light') + '.') && s.state === 'on');
-      const groups = all.filter((s) => Array.isArray(s.attributes.entity_id));
-      const single = all.filter((s) => !Array.isArray(s.attributes.entity_id) && !/screen|led|ring/i.test(s.entity_id));
-      const leds = all.filter((s) => /screen|led|ring/i.test(s.entity_id));
-      return cut(single.length + ' accese: ' + single.map((s) => s.attributes.friendly_name).join(', ') + (groups.length ? ' | gruppi accesi: ' + groups.map((s) => s.attributes.friendly_name).join(', ') : '') + (leds.length ? ' | spie e schermi (non sono luci): ' + leds.map((s) => s.attributes.friendly_name).join(', ') : ''));
+    // what is on in a domain (default light), grouped by room: Cync and other hubs expose the same lamp several
+    // times (room, group, bulb), so count rooms and lamps, never raw entities
+    on: async (domain) => {
+      const st = H().states;
+      const all = Object.values(st).filter((s) => s.entity_id.startsWith((domain || 'light') + '.') && s.state === 'on');
+      if (!G.reg) {
+        const [ents, devs, areas] = await Promise.all([WS({ type: 'config/entity_registry/list' }), WS({ type: 'config/device_registry/list' }), WS({ type: 'config/area_registry/list' })]);
+        G.reg = { ents: Object.fromEntries(ents.map((e) => [e.entity_id, e])), devs: Object.fromEntries(devs.map((d) => [d.id, d])), areas: Object.fromEntries(areas.map((a) => [a.area_id, a.name])) };
+      }
+      const R = G.reg, rooms = {}, leds = [];
+      all.forEach((s) => {
+        if (/screen|led|ring/i.test(s.entity_id)) { leds.push(s.attributes.friendly_name); return; }
+        const e = R.ents[s.entity_id] || {}, d = R.devs[e.device_id] || {};
+        const room = R.areas[e.area_id || d.area_id] || d.name_by_user || d.name || s.attributes.friendly_name;
+        (rooms[room] = rooms[room] || new Set()).add(d.id || s.entity_id);
+      });
+      const names = Object.keys(rooms);
+      return cut(names.length ? 'accese in ' + names.length + ' posti: ' + names.map((r) => r + (rooms[r].size > 1 ? ' (' + rooms[r].size + ' dispositivi)' : '')).join(', ') + (leds.length ? ' | spie e schermi, non luci: ' + leds.join(', ') : '') : 'nessuna accesa');
     },
     unavailable: () => {
       const l = Object.values(H().states).filter((s) => s.state === 'unavailable' && !/^(sensor|binary_sensor|button|update|event|number|select)\./.test(s.entity_id));
