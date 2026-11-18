@@ -1,10 +1,10 @@
 /* Gervàsia guardiano: watcher and speaker for the cloud guardian runs.
    Load in the Home Assistant tab:  await import('/local/guardiano_poller.js?v=1')  (or a <script> tag)
    Then: await __G.init({runId: <number>})  once, and  await __G.mon(30000)  in a loop.
-   Version 1, Nov 17 2026. */
+   Version 2, Nov 17 2026: test mode (localStorage guardiano_test = 1 makes typed requests count as spoken to the ReSpeaker). */
 (function () {
-  if (window.__G && window.__G.v === 1) return;
-  const G = (window.__G = { v: 1 });
+  if (window.__G && window.__G.v === 2) return;
+  const G = (window.__G = { v: 2 });
   const H = () => document.querySelector('home-assistant').hass;
   const WS = (msg) => H().connection.sendMessagePromise(msg);
   const NY = (t) => new Date(t).toLocaleTimeString('it-IT', { timeZone: 'America/New_York', hour12: false });
@@ -52,9 +52,11 @@
       (d.tool_calls || []).forEach((tc) => tools.push(clean(tc.tool_name + ' ' + JSON.stringify(tc.tool_args), 200)));
       if (d.role === 'tool_result') tools.push('risultato ' + d.tool_name + ': ' + clean(JSON.stringify(d.tool_result), 200));
     });
+    let typed = !stt && !!heard, sat = (rs && rs.data && rs.data.satellite_id) || null;
+    try { if (typed && localStorage.getItem('guardiano_test') === '1') { typed = false; sat = DEFAULT_SAT; } } catch (e) {}
     return {
       kind: 'voice', id: run.pipeline_run_id, time: NY(run.timestamp), assistant: p.name,
-      satellite: (rs && rs.data && rs.data.satellite_id) || null, typed: !stt && !!heard,
+      satellite: sat, typed,
       heard: clean(heard, 300), reply: clean(reply, 500), tools,
       errors: ev.filter((e) => e.type === 'error').map((e) => (e.data && e.data.code) || 'error'),
       intentEndMs: ie ? Date.parse(ie.timestamp) : null, replyLen: reply.length,
