@@ -5,10 +5,14 @@
    Version 3, Nov 18 2026: test environment. Requests on the "Gervàsia Test" pipeline arrive with test: true, in batches of
    their own. While such a batch is being handled (until the next __G.mon call) every action is sandboxed: nothing
    reaches the house, speech and actions are written to input_text.guardiano_test_cloud instead.
-   Version 4: read-only services (get_..., search) really run in the sandbox. */
+   Version 4: read-only services (get_..., search) really run in the sandbox.
+   Version 5: dedicated test runs. __G.init({runId, share: false, testOnly: true, out: 'input_text.x'}) sees only test voice
+   events, keeps the sandbox always on, writes to its own helper, marks localStorage guardiano_test_ready = runId when
+   ready and returns {kind: "end"} from __G.mon once localStorage guardiano_test_end equals its runId. Production runs
+   (testOnly false) now ignore test requests entirely. */
 (function () {
-  if (window.__G && window.__G.v === 4) return;
-  const G = (window.__G = { v: 4 });
+  if (window.__G && window.__G.v === 5) return;
+  const G = (window.__G = { v: 5 });
   const H = () => document.querySelector('home-assistant').hass;
   const WS = (msg) => H().connection.sendMessagePromise(msg);
   const NY = (t) => new Date(t).toLocaleTimeString('it-IT', { timeZone: 'America/New_York', hour12: false });
@@ -24,11 +28,13 @@
   const TEST_OUT = 'input_text.guardiano_test_cloud';
   const isTestPipe = (p) => /test/i.test((p && p.name) || '');
 
-  G.opts = { runId: null, share: true, oldMs: 120000 };
+  G.opts = { runId: null, share: true, oldMs: 120000, testOnly: false, out: TEST_OUT };
   G.seen = new Set(); G.prepped = new Set(); G.queue = []; G.waiters = [];
   G.hotUntil = 0; G.music = null; G.spoken = []; G.maSeen = new Set(); G.handoffSent = false; G.errors = 0;
 
-  function push(ev) { G.queue.push(ev); const w = G.waiters.splice(0); w.forEach((f) => f()); }
+  function push(ev) {
+    if (G.opts.testOnly && !(ev && (ev.test || ev.kind === 'end'))) return; // a test run never sees real events
+    G.queue.push(ev); const w = G.waiters.splice(0); w.forEach((f) => f()); }
   function persistSeen() {
     if (!G.opts.share) return;
     try { localStorage.setItem('guardiano_seen', JSON.stringify([...G.seen].slice(-60))); } catch (e) {}
@@ -86,6 +92,7 @@
         const types = ev.map((e) => e.type);
         const done = types.includes('intent-end') || types.includes('error') || types.includes('run-end');
         const s = summarise(p, run, ev);
+        if (!!s.test !== !!G.opts.testOnly) { G.seen.add(rid); continue; } // tests only to test runs, real only to production
         if (s.errors.length && s.errors.every((c) => c === 'duplicate_wake_up_detected') && !s.heard) { G.seen.add(rid); persistSeen(); continue; }
         if (isOwnEcho(s.heard)) { G.seen.add(rid); persistSeen(); continue; }
         if (!done) {
@@ -148,7 +155,7 @@
   const ts = () => new Date().toLocaleTimeString('it-IT', { hour12: false });
   function testWrite(text) {
     return G.realSend({ type: 'call_service', domain: 'input_text', service: 'set_value',
-      service_data: { value: (ts() + ' ' + text).slice(0, 255) }, target: { entity_id: TEST_OUT } }).catch(() => {});
+      service_data: { value: (ts() + ' ' + text).slice(0, 255) }, target: { entity_id: G.opts.out || TEST_OUT } }).catch(() => {});
   }
   function installSandbox() {
     const c = H().connection;
@@ -183,7 +190,9 @@
       try {
         handoffTick();
         await pollRuns();
-        if (Date.now() - lastMA > 60000) { lastMA = Date.now(); await pollMusicAssistant(); }
+        if (G.opts.testOnly) {
+          try { if (!G.endSent && localStorage.getItem('guardiano_test_end') === String(G.opts.runId)) { G.endSent = true; push({ kind: 'end' }); } } catch (e) {}
+        } else if (Date.now() - lastMA > 60000) { lastMA = Date.now(); await pollMusicAssistant(); }
         G.errors = 0;
       } catch (e) { G.errors++; if (G.errors === 5) push({ kind: 'poller_error', error: clean(e && e.message, 200) }); }
       await new Promise((r) => setTimeout(r, Date.now() < G.hotUntil ? 500 : 5000));
@@ -203,12 +212,13 @@
     installSandbox();
     if (!G.unsub) G.unsub = await H().connection.subscribeEvents(G.onState, 'state_changed');
     if (!G.looping) { G.looping = true; loop(); }
+    if (G.opts.testOnly) { G.sandbox = true; try { localStorage.setItem('guardiano_test_ready', String(G.opts.runId)); } catch (e) {} }
     return 'pronto: ' + G.pipes.map((p) => p.name).join(', ');
   };
 
   /* Wait for events: returns a JSON string (cleaned of ? & =), [] after waitMs with nothing new. */
   G.mon = (waitMs) => new Promise((res) => {
-    G.sandbox = false; // the previous batch is done
+    G.sandbox = !!G.opts.testOnly; // the previous batch is done (a test run stays sandboxed throughout)
     const out = () => {
       // test events and real events never share a batch, so the sandbox covers exactly the test ones
       const first = G.queue[0];
@@ -216,7 +226,7 @@
       let n = 0;
       while (n < G.queue.length && isT(G.queue[n]) === isT(first)) n++;
       const batch = G.queue.splice(0, n);
-      G.sandbox = isT(first);
+      G.sandbox = !!G.opts.testOnly || isT(first);
       res(JSON.stringify(batch));
     };
     if (G.queue.length) return out();
@@ -237,8 +247,7 @@
   G.say = async (text, v) => {
     const h = H();
     if (G.sandbox || (v && v.test)) {
-      const w = v && v.intentEndMs ? v.intentEndMs + (v.replyLen || 0) * 70 + 1500 - Date.now() : 0;
-      if (w > 0) await new Promise((r) => setTimeout(r, Math.min(w, 20000)));
+      // no wait for her reply here: test timings measure the guardian only (same as the add-on)
       G.spoken.push({ t: Date.now(), text: text.toLowerCase().replace(/[^\p{L}\p{N} ]/gu, '') });
       await testWrite(text);
       return 'detto (test)';
