@@ -233,6 +233,14 @@
 
   G.init = async (opts) => {
     Object.assign(G.opts, opts || {});
+    // Version 13, Nov 19: keep this tab's Home Assistant connection open while the tab is hidden (behind fullscreen video).
+    // Tab scoped: same effect as turning off "Automatically close connection", for this page only, not saved.
+    try {
+      const ha = document.querySelector('home-assistant');
+      if (ha && typeof ha._updateHass === 'function') ha._updateHass({ suspendWhenHidden: false });
+      else if (ha && ha.hass) ha.hass.suspendWhenHidden = false;
+      if (G.dbg) G.dbg.keep = H().suspendWhenHidden === false;
+    } catch (e) { if (G.dbg) G.dbg.keep = 'err ' + e.message; }
     if (G.opts.share) { try { JSON.parse(localStorage.getItem('guardiano_seen') || '[]').forEach((x) => G.seen.add(x)); } catch (e) {} }
     const pl = await WS({ type: 'assist_pipeline/pipeline/list' });
     G.pipes = pl.pipelines;
