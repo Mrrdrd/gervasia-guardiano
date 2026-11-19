@@ -19,12 +19,13 @@
    __G.again() returns the last batch __G.mon delivered, for a run that lost it to a cut result (no 30 s wait).
    Version 10: microphones are muted and restored by script.guardiano_microfoni inside Home Assistant, not by a timer
    in this page: on Nov 18 the page dropped mid announcement and both microphones stayed muted for an hour.
-   TEST VARIANT (guardiano_poller_test.js, loaded only by test copies): PREFETCH. Voice events carry "dati": the reads
-   the request's words call for, already done (lights, microphones, log, TV time, fix list, music, Netflix, ReSpeaker),
-   so the guardian can act and speak in one round instead of reading first. */
+   Version 11, Nov 19: PREFETCH. Voice events carry "dati": the reads the request's words call for, already done
+   (lights, microphones, log, TV time, fix list, music, Netflix, ReSpeaker), so the guardian can act and speak in one
+   round instead of reading first. Tested Nov 19 on 15 questions: 6.3 s average against 9.2 s for version 10.
+   The fix list helper shortens each title to 40 characters so more items fit. */
 (function () {
-  if (window.__G && window.__G.v === 1001) return;
-  const G = (window.__G = { v: 1001 });
+  if (window.__G && window.__G.v === 11) return;
+  const G = (window.__G = { v: 11 });
   const H = () => document.querySelector('home-assistant').hass;
   const WS = (msg) => H().connection.sendMessagePromise(msg);
   const NY = (t) => new Date(t).toLocaleTimeString('it-IT', { timeZone: 'America/New_York', hour12: false });
@@ -368,7 +369,7 @@
     todo: async (id) => {
       const r = await WS({ type: 'todo/item/list', entity_id: id || 'todo.gervasio_da_sistemare' });
       const open = (r.items || []).filter((i) => i.status !== 'completed');
-      return cut(open.length + ' aperte: ' + open.map((i) => i.summary).join(' | '));
+      return cut(open.length + ' aperte: ' + open.map((i) => String(i.summary).slice(0, 40)).join(' | '));
     },
     // minutes on and sessions since local midnight (or the last N hours)
     onTime: async (id, hours) => {

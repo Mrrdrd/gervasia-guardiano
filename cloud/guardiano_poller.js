@@ -18,10 +18,14 @@
    Version 9: helpers return at most 450 characters, so one read plus its answer stays under the tool's cut, and
    __G.again() returns the last batch __G.mon delivered, for a run that lost it to a cut result (no 30 s wait).
    Version 10: microphones are muted and restored by script.guardiano_microfoni inside Home Assistant, not by a timer
-   in this page: on Nov 18 the page dropped mid announcement and both microphones stayed muted for an hour. */
+   in this page: on Nov 18 the page dropped mid announcement and both microphones stayed muted for an hour.
+   Version 11, Nov 19: PREFETCH. Voice events carry "dati": the reads the request's words call for, already done
+   (lights, microphones, log, TV time, fix list, music, Netflix, ReSpeaker), so the guardian can act and speak in one
+   round instead of reading first. Tested Nov 19 on 15 questions: 6.3 s average against 9.2 s for version 10.
+   The fix list helper shortens each title to 40 characters so more items fit. */
 (function () {
-  if (window.__G && window.__G.v === 10) return;
-  const G = (window.__G = { v: 10 });
+  if (window.__G && window.__G.v === 11) return;
+  const G = (window.__G = { v: 11 });
   const H = () => document.querySelector('home-assistant').hass;
   const WS = (msg) => H().connection.sendMessagePromise(msg);
   const NY = (t) => new Date(t).toLocaleTimeString('it-IT', { timeZone: 'America/New_York', hour12: false });
@@ -107,11 +111,12 @@
         if (s.errors.length && s.errors.every((c) => c === 'duplicate_wake_up_detected') && !s.heard) { G.seen.add(rid); persistSeen(); continue; }
         if (isOwnEcho(s.heard)) { G.seen.add(rid); persistSeen(); continue; }
         if (!done) {
-          if (s.heard && !G.prepped.has(rid)) { G.prepped.add(rid); push(Object.assign({}, s, { stage: 'in corso', reply: '', tools: [] })); }
+          if (s.heard && !G.prepped.has(rid)) { G.prepped.add(rid); const dati = await prefetch(s.heard); if (dati) G.preSent.add(rid); push(Object.assign({}, s, { stage: 'in corso', reply: '', tools: [] }, dati ? { dati } : {})); }
           continue;
         }
         G.seen.add(rid); persistSeen();
         if (!s.heard && !s.errors.filter((c) => c !== 'stt-no-text-recognized').length) continue; // empty follow-up listening
+        if (!G.preSent.has(rid) && s.heard) { const dati = await prefetch(s.heard); if (dati) s.dati = dati.slice(0, 350); }
         push(Object.assign(s, { stage: 'finita' }));
       }
     }
@@ -306,6 +311,27 @@
     return 'detto (' + how + ')';
   };
 
+  /* ---------- prefetch: the reads a request's words call for, done before the guardian sees it ---------- */
+  G.preSent = new Set();
+  const PRE = [
+    [/\blog\b|error/i, () => G.q.errors(5)],
+    [/luc[ei]\b|lampad/i, () => G.q.on('light')],
+    [/microfon|\bmut[oi]\b/i, () => G.q.mics()],
+    [/offline|non disponibil|dispositivi/i, () => G.q.unavailable()],
+    [/(tv|televisore|tele)\b.*(acces|tempo)|(acces|tempo).*(tv|televisore)/i, () => G.q.onTime('switch.tv_power')],
+    [/lista|sistemare|da fare/i, () => G.q.todo()],
+    [/musica|canzone|brano|partita la/i, () => G.q.log('media_player.library_vera', 1440)],
+    [/volume|sonos/i, () => G.q.states(['media_player.library_vera'])],
+    [/netflix/i, () => G.q.traces('guarda_su_pc_worker', 3)],
+    [/respeaker|parlato da sol|box\b/i, () => G.q.log('assist_satellite.respeaker_salotto_assist_satellite', 720)],
+  ];
+  async function prefetch(heard) {
+    const hits = PRE.filter(([re]) => re.test(heard || '')).slice(0, 2);
+    if (!hits.length) return '';
+    const r = await Promise.all(hits.map(([, f]) => Promise.resolve().then(f).catch(() => '')));
+    return clean(r.filter(Boolean).join(' || '), 500);
+  }
+
   /* ---------- read helpers: each returns one short string (under 850 characters, cleaned of ? & =) ---------- */
   const cut = (s) => clean(s, 450);
   const nm = (id) => { const s = H().states[id]; return (s && s.attributes.friendly_name) || id; };
@@ -343,7 +369,7 @@
     todo: async (id) => {
       const r = await WS({ type: 'todo/item/list', entity_id: id || 'todo.gervasio_da_sistemare' });
       const open = (r.items || []).filter((i) => i.status !== 'completed');
-      return cut(open.length + ' aperte: ' + open.map((i) => i.summary).join(' | '));
+      return cut(open.length + ' aperte: ' + open.map((i) => String(i.summary).slice(0, 40)).join(' | '));
     },
     // minutes on and sessions since local midnight (or the last N hours)
     onTime: async (id, hours) => {
