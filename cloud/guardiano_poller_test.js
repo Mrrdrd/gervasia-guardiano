@@ -305,6 +305,12 @@
   };
   G.say = async (text, v) => {
     const h = H();
+    // Version 15, Nov 19: only the run in charge speaks. A run that is no longer the owner (a newer run took over) stays silent,
+    // so two runs never answer the same request (Nov 19 15:47: two runs talked over each other and left the microphones muted).
+    if (!G.opts.testOnly && !(G.sandbox || (v && v.test)) && G.opts.share !== false && G.opts.runId) {
+      const o = G.owner();
+      if (o && o.id !== G.opts.runId) { if (!G.handoffSent) { G.handoffSent = true; push({ kind: 'handoff', newer: o.id }); } return 'non detto: un giro più nuovo è al comando'; }
+    }
     if (G.sandbox || (v && v.test)) {
       // no wait for her reply here: test timings measure the guardian only (same as the add-on)
       G.spoken.push({ t: Date.now(), text: text.toLowerCase().replace(/[^\p{L}\p{N} ]/gu, '') });
