@@ -45,7 +45,7 @@
   const MA_ERR = /ERROR_BUFFERING|ERROR_PLAYBACK_FAILED|disconnected prematurely/;
   const TEST_OUT = 'input_text.guardiano_test_cloud';
   const isTestPipe = (p) => /test/i.test((p && p.name) || '');
-  const OBVIOUS = /non posso|non riesco|non ho accesso|non ho (?:uno |gli |lo |un )?strument|non trovo|non è possibile|non sono in grado|insufficient funds|si è verificato un errore/i;
+  const OBVIOUS = /non posso|non riesco|non ho accesso|non ho (?:uno |gli |lo |un )?strument|non trovo|non è possibile|non sono in grado|insufficient funds|si è verificato un errore|error talking to openai|errore (?:di comunicazione )?con openai|unexpected error|overloaded/i;
 
   G.opts = { runId: null, share: true, oldMs: 120000, testOnly: false, out: TEST_OUT };
   // Worker clock: Chrome throttles timers in a hidden tab to about once a minute; Worker timers are not throttled.
@@ -217,7 +217,7 @@
     let lastMA = 0;
     while (!G.stopped) {
       G.dbg.loopAt = Date.now();
-      if (!G.opts.testOnly && G.dbg.loopAt - (G.dbg.savedAt || 0) > 10000) { G.dbg.savedAt = G.dbg.loopAt; try { localStorage.setItem('guardiano_dbg', JSON.stringify({ run: G.opts.runId, loopAt: G.dbg.loopAt, pollOkAt: G.dbg.pollOkAt, monAt: G.dbg.monAt, lastErr: G.dbg.lastErr, life: G.dbg.life.slice(-8), vis: document.visibilityState, q: G.queue.length })); } catch (e) {} }
+      if (!G.opts.testOnly && G.dbg.loopAt - (G.dbg.savedAt || 0) > 10000) { G.dbg.savedAt = G.dbg.loopAt; G.saveDbg();  }
       try {
         handoffTick();
         if (G.opts.testOnly) { try { if (!G.endSent && localStorage.getItem('guardiano_test_end') === String(G.opts.runId)) { G.endSent = true; push({ kind: 'end' }); } } catch (e) {} }
@@ -420,5 +420,17 @@
     find: (text) => { const w = String(text).toLowerCase(); return cut(Object.values(H().states).filter((s) => (s.entity_id + ' ' + (s.attributes.friendly_name || '')).toLowerCase().includes(w)).slice(0, 15).map((s) => s.entity_id + '=' + s.state).join(' | ')); },
   };
 
-  G.stop = () => { G.stopped = true; if (G.unsub) { G.unsub(); G.unsub = null; } };
+  // Version 14: diagnostics also kept per run in localStorage guardiano_dbg_hist (last 6 runs), and a clean stop is marked,
+  // so a run that stops can be told apart afterwards: "end" set = run stopped normally; no "end" = tab closed or run cut off.
+  G.saveDbg = (end) => {
+    try {
+      const snap = { run: G.opts.runId, loopAt: G.dbg.loopAt, pollOkAt: G.dbg.pollOkAt, monAt: G.dbg.monAt, lastErr: G.dbg.lastErr, life: G.dbg.life.slice(-8), vis: document.visibilityState, q: G.queue.length, keep: G.dbg.keep };
+      if (end) snap.end = Date.now();
+      localStorage.setItem('guardiano_dbg', JSON.stringify(snap));
+      let h = []; try { h = JSON.parse(localStorage.getItem('guardiano_dbg_hist') || '[]'); } catch (e) {}
+      h = h.filter((x) => x.run !== snap.run); h.push(snap);
+      localStorage.setItem('guardiano_dbg_hist', JSON.stringify(h.slice(-6)));
+    } catch (e) {}
+  };
+  G.stop = () => { if (!G.opts.testOnly) G.saveDbg(true); G.stopped = true; if (G.unsub) { G.unsub(); G.unsub = null; } };
 })();
