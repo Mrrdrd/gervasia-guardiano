@@ -24,7 +24,8 @@
    round instead of reading first. Tested Nov 19 on 15 questions: 6.3 s average against 9.2 s for version 10.
    Version 12, Nov 19 2026: waits run on a Web Worker clock (Chrome slows timers in a hidden or covered tab to about once
    a minute); every Home Assistant call fails after 15 s and a polling round after 45 s instead of hanging for ever after
-   a reconnection; __G.dbg keeps loop, poll, error and page lifecycle times for diagnosis.
+   a reconnection; __G.dbg keeps loop, poll, error and page lifecycle times for diagnosis (a live run also copies
+   them every 10 s to localStorage guardiano_dbg, readable from any Home Assistant tab).
    The fix list helper shortens each title to 40 characters so more items fit. */
 (function () {
   if (window.__G && window.__G.v === 11) return;
@@ -216,6 +217,7 @@
     let lastMA = 0;
     while (!G.stopped) {
       G.dbg.loopAt = Date.now();
+      if (!G.opts.testOnly && G.dbg.loopAt - (G.dbg.savedAt || 0) > 10000) { G.dbg.savedAt = G.dbg.loopAt; try { localStorage.setItem('guardiano_dbg', JSON.stringify({ run: G.opts.runId, loopAt: G.dbg.loopAt, pollOkAt: G.dbg.pollOkAt, monAt: G.dbg.monAt, lastErr: G.dbg.lastErr, life: G.dbg.life.slice(-8), vis: document.visibilityState, q: G.queue.length })); } catch (e) {} }
       try {
         handoffTick();
         if (G.opts.testOnly) { try { if (!G.endSent && localStorage.getItem('guardiano_test_end') === String(G.opts.runId)) { G.endSent = true; push({ kind: 'end' }); } } catch (e) {} }
