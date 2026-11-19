@@ -27,7 +27,8 @@
   if (window.__G && window.__G.v === 11) return;
   const G = (window.__G = { v: 11 });
   const H = () => document.querySelector('home-assistant').hass;
-  const WS = (msg) => H().connection.sendMessagePromise(msg);
+  // every websocket call gets a 15 s limit: after a reconnection a pending call can stay unanswered for ever, which froze the loop
+  const WS = (msg) => new Promise((res, rej) => { let d = false; const t = wSet(() => { if (!d) { d = true; rej(new Error('ws timeout ' + msg.type)); } }, 15000); H().connection.sendMessagePromise(msg).then((v) => { if (!d) { d = true; wClear(t); res(v); } }, (e) => { if (!d) { d = true; wClear(t); rej(e); } }); });
   const NY = (t) => new Date(t).toLocaleTimeString('it-IT', { timeZone: 'America/New_York', hour12: false });
   const clean = (s, n) => String(s == null ? '' : s).replace(/[?&=]/g, ' ').slice(0, n || 400);
   const MICS = ['switch.esp32_s3_box_3_63bb38_mute', 'switch.respeaker_salotto_microphone_mute'];
@@ -211,9 +212,9 @@
     while (!G.stopped) {
       try {
         handoffTick();
-        await pollRuns();
+        if (G.opts.testOnly) { try { if (!G.endSent && localStorage.getItem('guardiano_test_end') === String(G.opts.runId)) { G.endSent = true; push({ kind: 'end' }); } } catch (e) {} }
+        await Promise.race([pollRuns(), new Promise((r, j) => wSet(() => j(new Error('poll timeout')), 45000))]);
         if (G.opts.testOnly) {
-          try { if (!G.endSent && localStorage.getItem('guardiano_test_end') === String(G.opts.runId)) { G.endSent = true; push({ kind: 'end' }); } } catch (e) {}
         } else if (Date.now() - lastMA > 60000) { lastMA = Date.now(); await pollMusicAssistant(); }
         G.errors = 0;
       } catch (e) { G.errors++; if (G.errors === 5) push({ kind: 'poller_error', error: clean(e && e.message, 200) }); }
@@ -230,7 +231,7 @@
     G.voicePipe = G.pipes.find((p) => /gerv/i.test(p.name)) || G.pipes[0];
     for (const p of G.pipes) {
       const l = await WS({ type: 'assist_pipeline/pipeline_debug/list', pipeline_id: p.id });
-      (l.pipeline_runs || []).forEach((r) => { if (Date.now() - Date.parse(r.timestamp) > G.opts.oldMs) G.seen.add(r.pipeline_run_id); });
+      (l.pipeline_runs || []).forEach((r) => { if (G.opts.testOnly || Date.now() - Date.parse(r.timestamp) > G.opts.oldMs) G.seen.add(r.pipeline_run_id); });
     }
     installSandbox();
     if (!G.unsub) G.unsub = await H().connection.subscribeEvents(G.onState, 'state_changed');
