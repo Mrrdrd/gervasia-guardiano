@@ -22,12 +22,16 @@
    Version 11, Nov 19: PREFETCH. Voice events carry "dati": the reads the request's words call for, already done
    (lights, microphones, log, TV time, fix list, music, Netflix, ReSpeaker), so the guardian can act and speak in one
    round instead of reading first. Tested Nov 19 on 15 questions: 6.3 s average against 9.2 s for version 10.
+   Version 12, Nov 19 2026: waits run on a Web Worker clock (Chrome slows timers in a hidden or covered tab to about once
+   a minute); every Home Assistant call fails after 15 s and a polling round after 45 s instead of hanging for ever after
+   a reconnection; __G.dbg keeps loop, poll, error and page lifecycle times for diagnosis.
    The fix list helper shortens each title to 40 characters so more items fit. */
 (function () {
   if (window.__G && window.__G.v === 11) return;
   const G = (window.__G = { v: 11 });
   const H = () => document.querySelector('home-assistant').hass;
-  const WS = (msg) => H().connection.sendMessagePromise(msg);
+  // every websocket call gets a 15 s limit: after a reconnection a pending call can stay unanswered for ever, which froze the loop
+  const WS = (msg) => new Promise((res, rej) => { let d = false; const t = wSet(() => { if (!d) { d = true; rej(new Error('ws timeout ' + msg.type)); } }, 15000); H().connection.sendMessagePromise(msg).then((v) => { if (!d) { d = true; wClear(t); res(v); } }, (e) => { if (!d) { d = true; wClear(t); rej(e); } }); });
   const NY = (t) => new Date(t).toLocaleTimeString('it-IT', { timeZone: 'America/New_York', hour12: false });
   const clean = (s, n) => String(s == null ? '' : s).replace(/[?&=]/g, ' ').slice(0, n || 400);
   const MICS = ['switch.esp32_s3_box_3_63bb38_mute', 'switch.respeaker_salotto_microphone_mute'];
@@ -43,7 +47,15 @@
   const OBVIOUS = /non posso|non riesco|non ho accesso|non ho (?:uno |gli |lo |un )?strument|non trovo|non è possibile|non sono in grado|insufficient funds|si è verificato un errore/i;
 
   G.opts = { runId: null, share: true, oldMs: 120000, testOnly: false, out: TEST_OUT };
+  // Worker clock: Chrome throttles timers in a hidden tab to about once a minute; Worker timers are not throttled.
+  const _wk = (() => { try { return new Worker(URL.createObjectURL(new Blob(['onmessage=e=>setTimeout(()=>postMessage(e.data.id),e.data.ms)']))); } catch (e) { return null; } })();
+  const _pend = {}; let _nid = 0;
+  if (_wk) _wk.onmessage = (e) => { const f = _pend[e.data]; delete _pend[e.data]; if (f) f(); };
+  const wSet = (fn, ms) => { if (!_wk) return setTimeout(fn, ms); const id = ++_nid; _pend[id] = fn; _wk.postMessage({ id, ms }); return 'w' + id; };
+  const wClear = (h) => { if (typeof h === 'string') delete _pend[h.slice(1)]; else clearTimeout(h); };
   G.seen = new Set(); G.prepped = new Set(); G.queue = []; G.waiters = [];
+  G.dbg = { loopAt: 0, pollOkAt: 0, monAt: 0, lastErr: '', life: [] };
+  try { ['freeze', 'resume', 'visibilitychange', 'pagehide', 'pageshow'].forEach((ev) => document.addEventListener(ev, () => { G.dbg.life.push(new Date().toTimeString().slice(0, 8) + ' ' + ev + ' ' + document.visibilityState); G.dbg.life = G.dbg.life.slice(-30); }, { capture: true })); } catch (e) {}
   G.hotUntil = 0; G.music = null; G.spoken = []; G.maSeen = new Set(); G.handoffSent = false; G.errors = 0;
 
   function push(ev) {
@@ -203,16 +215,17 @@
   async function loop() {
     let lastMA = 0;
     while (!G.stopped) {
+      G.dbg.loopAt = Date.now();
       try {
         handoffTick();
-        await pollRuns();
+        if (G.opts.testOnly) { try { if (!G.endSent && localStorage.getItem('guardiano_test_end') === String(G.opts.runId)) { G.endSent = true; push({ kind: 'end' }); } } catch (e) {} }
+        await Promise.race([pollRuns(), new Promise((r, j) => wSet(() => j(new Error('poll timeout')), 45000))]);
         if (G.opts.testOnly) {
-          try { if (!G.endSent && localStorage.getItem('guardiano_test_end') === String(G.opts.runId)) { G.endSent = true; push({ kind: 'end' }); } } catch (e) {}
         } else if (Date.now() - lastMA > 60000) { lastMA = Date.now(); await pollMusicAssistant(); }
-        G.errors = 0;
-      } catch (e) { G.errors++; if (G.errors === 5) push({ kind: 'poller_error', error: clean(e && e.message, 200) }); }
+        G.errors = 0; G.dbg.pollOkAt = Date.now();
+      } catch (e) { G.dbg.lastErr = new Date().toTimeString().slice(0, 8) + ' ' + clean(e && e.message, 120); G.errors++; if (G.errors === 5) push({ kind: 'poller_error', error: clean(e && e.message, 200) }); }
       // a test run polls fast all the time: typed tests move no satellite, which is what makes a live run poll fast
-      await new Promise((r) => setTimeout(r, (G.opts.testOnly || Date.now() < G.hotUntil) ? 500 : 5000));
+      await new Promise((r) => wSet(r, (G.opts.testOnly || Date.now() < G.hotUntil) ? 500 : 5000));
     }
   }
 
@@ -224,7 +237,7 @@
     G.voicePipe = G.pipes.find((p) => /gerv/i.test(p.name)) || G.pipes[0];
     for (const p of G.pipes) {
       const l = await WS({ type: 'assist_pipeline/pipeline_debug/list', pipeline_id: p.id });
-      (l.pipeline_runs || []).forEach((r) => { if (Date.now() - Date.parse(r.timestamp) > G.opts.oldMs) G.seen.add(r.pipeline_run_id); });
+      (l.pipeline_runs || []).forEach((r) => { if (G.opts.testOnly || Date.now() - Date.parse(r.timestamp) > G.opts.oldMs) G.seen.add(r.pipeline_run_id); });
     }
     installSandbox();
     if (!G.unsub) G.unsub = await H().connection.subscribeEvents(G.onState, 'state_changed');
@@ -235,6 +248,7 @@
 
   /* Wait for events: returns a JSON string (cleaned of ? & =), [] after waitMs with nothing new. */
   G.mon = (waitMs) => new Promise((res) => {
+    G.dbg.monAt = Date.now();
     G.sandbox = !!G.opts.testOnly; // the previous batch is done (a test run stays sandboxed throughout)
     const out = () => {
       // test events and real events never share a batch, so the sandbox covers exactly the test ones
@@ -263,8 +277,8 @@
       res(JSON.stringify(batch));
     };
     if (G.queue.length) return out();
-    const t = setTimeout(out, Math.min(waitMs || 30000, 30000));
-    G.waiters.push(() => { clearTimeout(t); setTimeout(out, 300); });
+    const t = wSet(out, Math.min(waitMs || 30000, 30000));
+    G.waiters.push(() => { wClear(t); wSet(out, 300); });
   });
   window.__mon = G.mon;
   /* The last batch __G.mon returned (and how many seconds ago), for a run whose result was cut. */
@@ -291,14 +305,14 @@
     const cfg = SATS[sat];
     const wait = v && v.intentEndMs ? v.intentEndMs + (v.replyLen || 0) * 70 + 1500 - Date.now() : 0;
     const url = await G.tts(text);
-    if (wait > 0) await new Promise((r) => setTimeout(r, Math.min(wait, 20000)));
+    if (wait > 0) await new Promise((r) => wSet(r, Math.min(wait, 20000)));
     // which microphones to switch back on at the end: those that were live before we spoke. While an earlier
     // announcement is still muting them, keep its list (they read as muted because of us, not of a person).
     const secs = Math.ceil((text.length * 80 + 4000) / 1000);
     if (!(G.micUntil > Date.now())) G.micRestore = MICS.filter((m) => (h.states[m] || {}).state !== 'on');
     G.micUntil = Date.now() + secs * 1000;
     await h.callService('script', 'turn_on', { variables: { secondi: secs, ripristina: G.micRestore } }, { entity_id: 'script.guardiano_microfoni' });
-    await new Promise((r) => setTimeout(r, 300));
+    await new Promise((r) => wSet(r, 300));
     G.spoken.push({ t: Date.now(), text: text.toLowerCase().replace(/[^\p{L}\p{N} ]/gu, '') });
     let how = '';
     try {

@@ -22,6 +22,9 @@
    Version 11, Nov 19: PREFETCH. Voice events carry "dati": the reads the request's words call for, already done
    (lights, microphones, log, TV time, fix list, music, Netflix, ReSpeaker), so the guardian can act and speak in one
    round instead of reading first. Tested Nov 19 on 15 questions: 6.3 s average against 9.2 s for version 10.
+   Version 12, Nov 19 2026: waits run on a Web Worker clock (Chrome slows timers in a hidden or covered tab to about once
+   a minute); every Home Assistant call fails after 15 s and a polling round after 45 s instead of hanging for ever after
+   a reconnection; __G.dbg keeps loop, poll, error and page lifecycle times for diagnosis.
    The fix list helper shortens each title to 40 characters so more items fit. */
 (function () {
   if (window.__G && window.__G.v === 11) return;
@@ -51,6 +54,8 @@
   const wSet = (fn, ms) => { if (!_wk) return setTimeout(fn, ms); const id = ++_nid; _pend[id] = fn; _wk.postMessage({ id, ms }); return 'w' + id; };
   const wClear = (h) => { if (typeof h === 'string') delete _pend[h.slice(1)]; else clearTimeout(h); };
   G.seen = new Set(); G.prepped = new Set(); G.queue = []; G.waiters = [];
+  G.dbg = { loopAt: 0, pollOkAt: 0, monAt: 0, lastErr: '', life: [] };
+  try { ['freeze', 'resume', 'visibilitychange', 'pagehide', 'pageshow'].forEach((ev) => document.addEventListener(ev, () => { G.dbg.life.push(new Date().toTimeString().slice(0, 8) + ' ' + ev + ' ' + document.visibilityState); G.dbg.life = G.dbg.life.slice(-30); }, { capture: true })); } catch (e) {}
   G.hotUntil = 0; G.music = null; G.spoken = []; G.maSeen = new Set(); G.handoffSent = false; G.errors = 0;
 
   function push(ev) {
@@ -210,14 +215,15 @@
   async function loop() {
     let lastMA = 0;
     while (!G.stopped) {
+      G.dbg.loopAt = Date.now();
       try {
         handoffTick();
         if (G.opts.testOnly) { try { if (!G.endSent && localStorage.getItem('guardiano_test_end') === String(G.opts.runId)) { G.endSent = true; push({ kind: 'end' }); } } catch (e) {} }
         await Promise.race([pollRuns(), new Promise((r, j) => wSet(() => j(new Error('poll timeout')), 45000))]);
         if (G.opts.testOnly) {
         } else if (Date.now() - lastMA > 60000) { lastMA = Date.now(); await pollMusicAssistant(); }
-        G.errors = 0;
-      } catch (e) { G.errors++; if (G.errors === 5) push({ kind: 'poller_error', error: clean(e && e.message, 200) }); }
+        G.errors = 0; G.dbg.pollOkAt = Date.now();
+      } catch (e) { G.dbg.lastErr = new Date().toTimeString().slice(0, 8) + ' ' + clean(e && e.message, 120); G.errors++; if (G.errors === 5) push({ kind: 'poller_error', error: clean(e && e.message, 200) }); }
       // a test run polls fast all the time: typed tests move no satellite, which is what makes a live run poll fast
       await new Promise((r) => wSet(r, (G.opts.testOnly || Date.now() < G.hotUntil) ? 500 : 5000));
     }
@@ -242,6 +248,7 @@
 
   /* Wait for events: returns a JSON string (cleaned of ? & =), [] after waitMs with nothing new. */
   G.mon = (waitMs) => new Promise((res) => {
+    G.dbg.monAt = Date.now();
     G.sandbox = !!G.opts.testOnly; // the previous batch is done (a test run stays sandboxed throughout)
     const out = () => {
       // test events and real events never share a batch, so the sandbox covers exactly the test ones
