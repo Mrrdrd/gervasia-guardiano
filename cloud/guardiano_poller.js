@@ -71,6 +71,14 @@
   G.owner = () => { try { return JSON.parse(localStorage.getItem('guardiano_owner') || 'null'); } catch (e) { return null; } };
   G.takeOver = () => { localStorage.setItem('guardiano_owner', JSON.stringify({ id: G.opts.runId, t: Date.now() })); return true; };
   G.isOwner = () => { const o = G.owner(); return !!o && o.id === G.opts.runId; };
+  // Version 16, Nov 19: a live run that a newer run has replaced is "retired". Old runs ignored the one off handoff event
+  // and kept watching until minute 40 of the next hour, so two runs watched at once: now a retired run gets the handoff on
+  // every __G.mon call and cannot change anything in Home Assistant (its service calls are refused).
+  G.retired = () => {
+    if (G.opts.testOnly || G.opts.share === false || !G.opts.runId) return false;
+    const o = G.owner(); return !!o && o.id > G.opts.runId;
+  };
+  G.initAt = Date.now();
   function handoffTick() {
     if (!G.opts.share || !G.opts.runId) return;
     const o = G.owner();
@@ -191,6 +199,9 @@
     if (c.__gSandbox) { G.realSend = c.__gRealSend; return; }
     G.realSend = c.__gRealSend = c.sendMessagePromise.bind(c);
     c.sendMessagePromise = (msg) => {
+      if (!G.sandbox && msg && msg.type === 'call_service' && !/^(get_|search$)/.test(msg.service || '') && G.retired()) {
+        return Promise.reject(new Error('azione bloccata: un giro più nuovo è al comando, chiama __G.stop e termina'));
+      }
       if (G.sandbox && msg && msg.type === 'call_service' && !/^(get_|search$)/.test(msg.service || '')) {
         const what = msg.domain + '.' + msg.service + ' ' + JSON.stringify(msg.target || {}) + ' ' + JSON.stringify(msg.service_data || {});
         G.sandboxLog.push({ t: Date.now(), what });
@@ -202,6 +213,9 @@
     const realFetch = window.fetch.bind(window);
     window.fetch = (u, o) => {
       const url = String((u && u.url) || u);
+      if (!G.sandbox && /\/api\/services\//.test(url) && !/\/api\/services\/[^/]+\/(get_|search)/.test(url) && o && String(o.method || '').toUpperCase() === 'POST' && G.retired()) {
+        return Promise.reject(new Error('azione bloccata: un giro più nuovo è al comando'));
+      }
       if (G.sandbox && /\/api\/services\//.test(url) && !/\/api\/services\/[^/]+\/(get_|search)/.test(url) && o && String(o.method || '').toUpperCase() === 'POST') {
         G.sandboxLog.push({ t: Date.now(), what: 'REST ' + url });
         testWrite('AZIONE ' + url.replace(/.*\/api\/services\//, '') + ' ' + String(o.body || '').slice(0, 150));
@@ -217,6 +231,8 @@
     let lastMA = 0;
     while (!G.stopped) {
       G.dbg.loopAt = Date.now();
+      // Version 16: a live loop that no agent has read for 6 minutes stops itself, so the heartbeat means an agent is watching
+      if (!G.opts.testOnly && G.dbg.loopAt - (G.dbg.monAt || G.initAt) > 360000) { G.orphaned = true; G.dbg.lastErr = 'orfano: nessun __G.mon da 6 min'; G.saveDbg(true); G.stop(); break; }
       if (!G.opts.testOnly && G.dbg.loopAt - (G.dbg.savedAt || 0) > 10000) { G.dbg.savedAt = G.dbg.loopAt; G.saveDbg();  }
       try {
         handoffTick();
@@ -259,6 +275,8 @@
   /* Wait for events: returns a JSON string (cleaned of ? & =), [] after waitMs with nothing new. */
   G.mon = (waitMs) => new Promise((res) => {
     G.dbg.monAt = Date.now();
+    if (G.retired()) { const o = G.owner(); G.queue = []; return res(JSON.stringify([{ kind: 'handoff', newer: o && o.id, sticky: true }])); }
+    if (G.orphaned) return res(JSON.stringify([{ kind: 'poller_error', error: 'loop fermato: nessuna chiamata a __G.mon da 6 minuti, ricarica come in 1.5' }]));
     G.sandbox = !!G.opts.testOnly; // the previous batch is done (a test run stays sandboxed throughout)
     const out = () => {
       // test events and real events never share a batch, so the sandbox covers exactly the test ones
