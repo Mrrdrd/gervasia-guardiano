@@ -134,10 +134,17 @@
       intentEndMs: ie ? Date.parse(ie.timestamp) : null, replyLen: reply.length,
     };
   }
+  // Version 17.2, Nov 21: in a conversation the device listens right after speaking and sometimes hears its own voice
+  // back, with small transcription differences (12:21 "la ricerca su Netflix è durata 75 secondi"). An utterance counts as
+  // our echo when most of its words were in something we said in the last 45 s.
   function isOwnEcho(heard) {
-    const h = (heard || '').toLowerCase().replace(/[^\p{L}\p{N} ]/gu, '').trim();
+    const h = (heard || '').toLowerCase().replace(/[^\p{L}\p{N} ]/gu, ' ').replace(/\s+/g, ' ').trim();
     if (!h) return false;
-    return G.spoken.some((s) => Date.now() - s.t < 30000 && (s.text.includes(h) || h.includes(s.text)));
+    const recent = G.spoken.filter((s) => Date.now() - s.t < 45000);
+    if (recent.some((s) => s.text.includes(h) || h.includes(s.text))) return true;
+    const words = h.split(' ').filter((w) => w.length > 2);
+    if (words.length < 3) return false;
+    return recent.some((s) => { const sw = new Set(s.text.split(/\s+/)); const n = words.filter((w) => sw.has(w)).length; return n >= 4 && n / words.length >= 0.45; });
   }
   async function pollRuns() {
     for (const p of G.pipes) {
