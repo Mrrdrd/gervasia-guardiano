@@ -1,0 +1,33 @@
+name: Chi parla
+version: "1.0.0"
+slug: chi_parla
+description: >-
+  Speech to text for Gervàsia that also recognises who is speaking. Audio goes on
+  to Home Assistant Cloud as before; a local CAM++ model compares the voice with
+  the family's voiceprints and writes the name to input_text.chi_parla.
+url: https://github.com/Mrrdrd/gervasia-guardiano
+arch:
+  - amd64
+init: false
+boot: auto
+startup: services
+homeassistant_api: true
+ports:
+  10400/tcp: null
+map:
+  - type: share
+    read_only: false
+options:
+  stt_entity: stt.home_assistant_cloud
+  helper: input_text.chi_parla
+  voiceprints: /share/chi_parla/voiceprints.json
+  log_file: /share/chi_parla/log.jsonl
+  min_score: 0.45
+  min_margin: 0.08
+schema:
+  stt_entity: str
+  helper: str
+  voiceprints: str
+  log_file: str
+  min_score: float
+  min_margin: float

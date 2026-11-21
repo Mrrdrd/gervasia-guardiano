@@ -18,3 +18,8 @@ It starts in **shadow mode**: it only writes what it would do, to
 5. Start it. Turn `shadow_mode` off when its decisions look right.
 
 Home-specific instructions and settings never live in this repository.
+
+
+## Chi parla (chi_parla/)
+
+Speech to text for Gervàsia that also recognises who is speaking. Home Assistant sends each request's audio here over Wyoming; it is streamed on to Home Assistant Cloud speech to text as before, and a local CAM++ model (3D-Speaker) compares the voice with the family voiceprints, writing "Name|alta|time" to input_text.chi_parla before the transcript returns. Voiceprints are kept only on the HP in /share/chi_parla/voiceprints.json, never in this repository.
