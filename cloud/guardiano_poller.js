@@ -50,17 +50,18 @@
   const CONV = 'input_boolean.guardiano_conversazione', EXPERT = 'input_boolean.guardiano_esperto';
   const isConvPipe = (p) => /^guardiano$/i.test((p && p.name) || '');
   const pick = (a) => a[Math.floor(Math.random() * a.length)];
+  // Nov 21: people never hear about a guardian or an expert: every line is Gervàsia's own voice.
   const FILL = ['Fammici pensare un attimo.', 'Questo lo devo cercare, un secondo.', 'Vediamo un po\'.', 'Controllo subito, dammi un attimo.',
-    'Un momento che guardo.', 'Bella domanda, ci penso.', 'Aspetta che do un\'occhiata ai registri.', 'Ci guardo subito.'];
-  const FILL_EXPERT = ['Questa è roba da esperti, fammi ragionare.', 'Mi metto gli occhiali e guardo bene.', 'Analizzo con calma, un attimo di pazienza.',
-    'Ci vuole un ragionamento serio, dammi qualche secondo.', 'Apro i registri e faccio due conti.', 'Mmm, interessante. Ci penso su.',
-    'Lasciami mettere insieme i pezzi.', 'Sto incrociando un po\' di indizi.', 'Faccio il detective per un momento.', 'Indago e torno da te tra poco.',
-    'Fammi controllare tutto per bene.', 'Un attimo, sto leggendo cosa è successo.'];
-  const HELLO = ['Sono il guardiano. Dimmi pure.', 'Eccomi, sono il guardiano. Cosa succede?', 'Ci sono io, il guardiano. Raccontami.'];
-  const HELLO_EXPERT = ['Sono il guardiano esperto. Raccontami cosa non va.', 'Eccomi, guardiano esperto in linea. Dimmi tutto.',
-    'Arrivato il rinforzo. Cosa è successo?', 'Guardiano esperto qui. Partiamo dal problema.'];
-  const CALL_EXPERT = ['Chiamo il mio collega esperto, dammi un minuto.', 'Faccio venire il guardiano esperto, ci vuole circa un minuto.',
-    'Questa la passo all\'esperto. Un minuto e arriva.'];
+    'Un momento che guardo.', 'Bella domanda, ci penso.', 'Aspetta che do un\'occhiata.', 'Ci guardo subito.'];
+  const FILL_EXPERT = ['Fammi ragionare con calma.', 'Mi metto gli occhiali e guardo bene.', 'Analizzo con calma, un attimo di pazienza.',
+    'Qui ci vuole un ragionamento serio, dammi qualche secondo.', 'Controllo un po\' di cose e faccio due conti.', 'Mmm, interessante. Ci penso su.',
+    'Lasciami mettere insieme i pezzi.', 'Sto incrociando un po\' di indizi.', 'Faccio la detective per un momento.', 'Indago e torno da te tra poco.',
+    'Fammi controllare tutto per bene.', 'Un attimo, sto ricostruendo cosa è successo.'];
+  const HELLO = ['Eccomi. Dimmi pure cosa non va.', 'Certo, guardiamoci insieme. Raccontami.', 'Ci sono. Cosa è successo?'];
+  const HELLO_EXPERT = ['Eccomi, adesso ho tutto sotto mano. Raccontami ancora cosa non va.', 'Rieccomi, ho guardato con calma. Dimmi.',
+    'Ci sono, ho controllato un po\' di cose. Partiamo dal problema.', 'Eccomi. Ora possiamo guardarci per bene.'];
+  const CALL_EXPERT = ['Questa richiede un ragionamento in più, dammi un minuto.', 'Fammi guardare con più calma, mi serve circa un minuto.',
+    'Ci penso con attenzione, un minuto e torno da te.'];
   const convOn = () => (H().states[CONV] || {}).state === 'on';
   const expertOn = () => (H().states[EXPERT] || {}).state === 'on';
   // the run that holds the conversation: the expert run when EXPERT is on, otherwise the normal run in charge
@@ -322,7 +323,7 @@
       G.expertAskedAt = 0;
       H().callService('input_boolean', 'turn_off', {}, { entity_id: EXPERT }).catch(() => {});
       push({ kind: 'expert_missing', time: NY(Date.now()) });
-      G.ask('Il guardiano esperto non è arrivato, continuo io. Dimmi pure.', { satellite: G.lastSat || DEFAULT_SAT }).catch(() => {});
+      G.ask('Scusa l\'attesa. Dimmi pure.', { satellite: G.lastSat || DEFAULT_SAT }).catch(() => {});
     }
     if (!expertOn()) G.expertAskedAt = 0;
   }
