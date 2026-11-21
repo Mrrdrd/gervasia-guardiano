@@ -28,8 +28,8 @@
    them every 10 s to localStorage guardiano_dbg, readable from any Home Assistant tab).
    The fix list helper shortens each title to 40 characters so more items fit. */
 (function () {
-  if (window.__G && window.__G.v === 11) return;
-  const G = (window.__G = { v: 11 });
+  if (window.__G && window.__G.v === 17) return;
+  const G = (window.__G = { v: 17 });
   const H = () => document.querySelector('home-assistant').hass;
   // every websocket call gets a 15 s limit: after a reconnection a pending call can stay unanswered for ever, which froze the loop
   const WS = (msg) => new Promise((res, rej) => { let d = false; const t = wSet(() => { if (!d) { d = true; rej(new Error('ws timeout ' + msg.type)); } }, 15000); H().connection.sendMessagePromise(msg).then((v) => { if (!d) { d = true; wClear(t); res(v); } }, (e) => { if (!d) { d = true; wClear(t); rej(e); } }); });
@@ -44,6 +44,27 @@
   const WATCH_SCRIPTS = ['script.guarda_su_pc_worker', 'script.return_to_pc', 'script.esegui_routine_worker', 'script.tv_italia'];
   const MA_ERR = /ERROR_BUFFERING|ERROR_PLAYBACK_FAILED|disconnected prematurely/;
   const TEST_OUT = 'input_text.guardiano_test_cloud';
+  // Version 17, Nov 21: conversation with the guardian. script.guardiano_conversazione turns CONV on and moves both devices
+  // to the pipeline "Guardiano", whose agent always answers SILENZIO: every sentence then reaches the guardian, who answers
+  // with G.ask (speaks and listens again, no wake word). EXPERT on = the expert run (Opus) holds the conversation.
+  const CONV = 'input_boolean.guardiano_conversazione', EXPERT = 'input_boolean.guardiano_esperto';
+  const isConvPipe = (p) => /^guardiano$/i.test((p && p.name) || '');
+  const pick = (a) => a[Math.floor(Math.random() * a.length)];
+  const FILL = ['Fammici pensare un attimo.', 'Questo lo devo cercare, un secondo.', 'Vediamo un po\'.', 'Controllo subito, dammi un attimo.',
+    'Un momento che guardo.', 'Bella domanda, ci penso.', 'Aspetta che do un\'occhiata ai registri.', 'Ci guardo subito.'];
+  const FILL_EXPERT = ['Questa è roba da esperti, fammi ragionare.', 'Mi metto gli occhiali e guardo bene.', 'Analizzo con calma, un attimo di pazienza.',
+    'Ci vuole un ragionamento serio, dammi qualche secondo.', 'Apro i registri e faccio due conti.', 'Mmm, interessante. Ci penso su.',
+    'Lasciami mettere insieme i pezzi.', 'Sto incrociando un po\' di indizi.', 'Faccio il detective per un momento.', 'Indago e torno da te tra poco.',
+    'Fammi controllare tutto per bene.', 'Un attimo, sto leggendo cosa è successo.'];
+  const HELLO = ['Sono il guardiano. Dimmi pure.', 'Eccomi, sono il guardiano. Cosa succede?', 'Ci sono io, il guardiano. Raccontami.'];
+  const HELLO_EXPERT = ['Sono il guardiano esperto. Raccontami cosa non va.', 'Eccomi, guardiano esperto in linea. Dimmi tutto.',
+    'Arrivato il rinforzo. Cosa è successo?', 'Guardiano esperto qui. Partiamo dal problema.'];
+  const CALL_EXPERT = ['Chiamo il mio collega esperto, dammi un minuto.', 'Faccio venire il guardiano esperto, ci vuole circa un minuto.',
+    'Questa la passo all\'esperto. Un minuto e arriva.'];
+  const convOn = () => (H().states[CONV] || {}).state === 'on';
+  const expertOn = () => (H().states[EXPERT] || {}).state === 'on';
+  // the run that holds the conversation: the expert run when EXPERT is on, otherwise the normal run in charge
+  const convMine = () => (G.opts.expert ? expertOn() : !expertOn());
   const isTestPipe = (p) => /test/i.test((p && p.name) || '');
   const OBVIOUS = /non posso|non riesco|non ho accesso|non ho (?:uno |gli |lo |un )?strument|non trovo|non è possibile|non sono in grado|insufficient funds|si è verificato un errore|error talking to openai|errore (?:di comunicazione )?con openai|unexpected error|overloaded/i;
 
@@ -104,7 +125,7 @@
     if (test && typed) { typed = false; sat = sat || DEFAULT_SAT; }
     try { if (typed && localStorage.getItem('guardiano_test') === '1') { typed = false; sat = DEFAULT_SAT; } } catch (e) {}
     return {
-      kind: 'voice', id: run.pipeline_run_id, time: NY(run.timestamp), assistant: p.name,
+      kind: 'voice', conv: isConvPipe(p), id: run.pipeline_run_id, time: NY(run.timestamp), assistant: p.name,
       satellite: sat, typed, test,
       heard: clean(heard, 300), reply: clean(reply, 500), tools,
       errors: ev.filter((e) => e.type === 'error').map((e) => (e.data && e.data.code) || 'error'),
@@ -131,13 +152,18 @@
         if (!!s.test !== !!G.opts.testOnly) { G.seen.add(rid); continue; } // tests only to test runs, real only to production
         if (s.errors.length && s.errors.every((c) => c === 'duplicate_wake_up_detected') && !s.heard) { G.seen.add(rid); persistSeen(); continue; }
         if (isOwnEcho(s.heard)) { G.seen.add(rid); persistSeen(); continue; }
+        // Version 17: conversation sentences go only to the run holding the conversation; the expert run sees nothing else
+        if (G.opts.expert && !s.conv) { G.seen.add(rid); continue; }
+        if (s.conv && !G.opts.expert && expertOn() && !s.test) { G.seen.add(rid); persistSeen(); continue; }
+        if (s.satellite && !s.typed) G.lastSat = s.satellite;
         if (!done) {
           if (s.heard && !G.prepped.has(rid)) { G.prepped.add(rid); const dati = await prefetch(s.heard); if (dati) G.preSent.add(rid); push(Object.assign({}, s, { stage: 'in corso', reply: '', tools: [] }, dati ? { dati } : {})); }
           continue;
         }
         G.seen.add(rid); persistSeen();
         if (!s.heard && !s.errors.filter((c) => c !== 'stt-no-text-recognized').length) continue; // empty follow-up listening
-        if (!G.preSent.has(rid) && s.heard) { const dati = await prefetch(s.heard); if (dati) s.dati = dati.slice(0, 350); }
+        if (s.conv && s.heard) { G.convLast = Date.now(); if (!s.test) G.filler(s).catch(() => {}); }
+        if (!s.conv && !G.preSent.has(rid) && s.heard) { const dati = await prefetch(s.heard); if (dati) s.dati = dati.slice(0, 350); }
         push(Object.assign(s, { stage: 'finita' }));
       }
     }
@@ -163,6 +189,10 @@
     }
     if (WATCH_SCRIPTS.includes(id) && o && n && o.state === 'on' && n.state === 'off') { scriptDone(id); return; }
     if (id === 'input_text.drive_richiesta' && n) push({ kind: 'drive', time: NY(Date.now()), state: clean(n.state, 300) });
+    if (id === CONV && n && o && n.state !== o.state && !G.opts.testOnly) {
+      if (n.state === 'on') { G.convLast = Date.now(); convStart().catch(() => {}); }
+      else if (convMine() || G.opts.expert) push({ kind: 'conv_end', time: NY(Date.now()) });
+    }
   };
   async function scriptDone(id) {
     const item = id.split('.')[1];
@@ -226,6 +256,77 @@
     c.__gSandbox = true;
   }
 
+  /* ---------- conversation with the guardian (v17) ---------- */
+  async function convStart() {
+    await new Promise((r) => wSet(r, 1500)); // let the EXPERT switch settle (the script sets it just before CONV)
+    const sat = G.lastSat || DEFAULT_SAT;
+    if (G.opts.expert) return; // the expert greets itself in init
+    if (G.retired()) return;
+    if (expertOn()) {
+      push({ kind: 'conv_start', expert: true, satellite: sat, time: NY(Date.now()), todo: 'fai partire il guardiano esperto (fire_trigger)' });
+      G.say(pick(CALL_EXPERT), { satellite: sat }).catch(() => {});
+      return;
+    }
+    push({ kind: 'conv_start', expert: false, satellite: sat, time: NY(Date.now()) });
+    G.ask(pick(HELLO), { satellite: sat }).catch(() => {});
+  }
+  // a short "let me think" right after each sentence of the conversation, before the model starts reasoning
+  G.filler = async (v) => {
+    if (!convMine() || G.retired()) return;
+    if (Date.now() - (G.fillAt || 0) < 4000) return;
+    G.fillAt = Date.now();
+    return G.say(pick(G.opts.expert ? FILL_EXPERT : FILL), v);
+  };
+  /* G.ask(text, voiceEvent): speak as Gervàsia and keep listening for the answer (no wake word needed). Use it in the
+     conversation; the answer arrives as the next voice event with conv: true. */
+  G.ask = async (text, v) => {
+    const h = H();
+    if (G.sandbox || (v && v.test)) { G.spoken.push({ t: Date.now(), text: text.toLowerCase().replace(/[^\p{L}\p{N} ]/gu, '') }); await testWrite(text); return 'detto (test)'; }
+    if (!G.opts.expert && G.opts.share !== false && G.opts.runId) { const o = G.owner(); if (o && o.id !== G.opts.runId) return 'non detto: un giro più nuovo è al comando'; }
+    const sat = (v && v.satellite && SATS[v.satellite]) ? v.satellite : (G.lastSat || DEFAULT_SAT);
+    // wait for a filler or an earlier announcement to finish
+    for (let k = 0; k < 30 && G.micUntil > Date.now(); k++) await new Promise((r) => wSet(r, 500));
+    G.spoken.push({ t: Date.now(), text: text.toLowerCase().replace(/[^\p{L}\p{N} ]/gu, '') });
+    G.convLast = Date.now();
+    await h.callService('assist_satellite', 'start_conversation', { start_message: text, preannounce: false }, { entity_id: sat });
+    return 'detto, ora ascolta';
+  };
+  /* G.endConv(): closes the conversation; both devices go back to Gervàsia. */
+  G.endConv = async () => { await H().callService('script', 'turn_on', { variables: { fine: true } }, { entity_id: 'script.guardiano_conversazione' }); return 'conversazione chiusa'; };
+  /* Approval from Gabe's phone: G.propose(id, title, text) sends a notification with Approva / No; the answer arrives
+     as an event {kind: 'approval', id, ok}. Use it before any lasting change (a new script, a changed script). */
+  G.propose = async (id, title, text) => {
+    await H().callService('notify', 'mobile_app_rdr_iphone', { title: String(title).slice(0, 80), message: String(text).slice(0, 900),
+      data: { actions: [{ action: 'GUARDIANO_SI_' + id, title: 'Approva' }, { action: 'GUARDIANO_NO_' + id, title: 'No' }] } });
+    return 'proposta inviata a Gabe: ' + id;
+  };
+  function onAction(e) {
+    const a = String((e.data && e.data.action) || '');
+    const m = a.match(/^GUARDIANO_(SI|NO)_(.+)$/); if (!m) return;
+    if (G.opts.expert ? !expertOn() : expertOn()) return;
+    push({ kind: 'approval', id: m[2], ok: m[1] === 'SI', time: NY(Date.now()) });
+  }
+  function convTick() {
+    if (G.opts.testOnly) return;
+    if (G.opts.expert) { try { localStorage.setItem('guardiano_expert_alive', String(Date.now())); } catch (e) {} }
+    if (!convOn() || !convMine() || G.retired()) return;
+    // 3 minutes without a sentence: close the conversation
+    if (Date.now() - (G.convLast || Date.now()) > 180000) { G.convLast = Date.now(); G.endConv().catch(() => {}); push({ kind: 'conv_end', reason: 'silenzio da 3 minuti', time: NY(Date.now()) }); }
+  }
+  function expertWatch() {
+    // normal run: the expert was called but has not shown up in 3 minutes, so take the conversation back
+    if (G.opts.expert || G.opts.testOnly || !expertOn() || G.retired()) return;
+    const alive = Number(localStorage.getItem('guardiano_expert_alive') || 0);
+    const since = Date.now() - (G.expertAskedAt || (G.expertAskedAt = Date.now()));
+    if (since > 180000 && Date.now() - alive > 60000) {
+      G.expertAskedAt = 0;
+      H().callService('input_boolean', 'turn_off', {}, { entity_id: EXPERT }).catch(() => {});
+      push({ kind: 'expert_missing', time: NY(Date.now()) });
+      G.ask('Il guardiano esperto non è arrivato, continuo io. Dimmi pure.', { satellite: G.lastSat || DEFAULT_SAT }).catch(() => {});
+    }
+    if (!expertOn()) G.expertAskedAt = 0;
+  }
+
   /* ---------- main loop ---------- */
   async function loop() {
     let lastMA = 0;
@@ -235,7 +336,7 @@
       if (!G.opts.testOnly && G.dbg.loopAt - (G.dbg.monAt || G.initAt) > 360000) { G.orphaned = true; G.dbg.lastErr = 'orfano: nessun __G.mon da 6 min'; G.saveDbg(true); G.stop(); break; }
       if (!G.opts.testOnly && G.dbg.loopAt - (G.dbg.savedAt || 0) > 10000) { G.dbg.savedAt = G.dbg.loopAt; G.saveDbg();  }
       try {
-        handoffTick();
+        handoffTick(); convTick(); expertWatch();
         if (G.opts.testOnly) { try { if (!G.endSent && localStorage.getItem('guardiano_test_end') === String(G.opts.runId)) { G.endSent = true; push({ kind: 'end' }); } } catch (e) {} }
         await Promise.race([pollRuns(), new Promise((r, j) => wSet(() => j(new Error('poll timeout')), 45000))]);
         if (G.opts.testOnly) {
@@ -263,10 +364,15 @@
     G.voicePipe = G.pipes.find((p) => /gerv/i.test(p.name)) || G.pipes[0];
     for (const p of G.pipes) {
       const l = await WS({ type: 'assist_pipeline/pipeline_debug/list', pipeline_id: p.id });
-      (l.pipeline_runs || []).forEach((r) => { if (G.opts.testOnly || Date.now() - Date.parse(r.timestamp) > G.opts.oldMs) G.seen.add(r.pipeline_run_id); });
+      (l.pipeline_runs || []).forEach((r) => { if (G.opts.testOnly || G.opts.expert || Date.now() - Date.parse(r.timestamp) > G.opts.oldMs) G.seen.add(r.pipeline_run_id); });
     }
     installSandbox();
     if (!G.unsub) G.unsub = await H().connection.subscribeEvents(G.onState, 'state_changed');
+    if (!G.unsubAct && !G.opts.testOnly) G.unsubAct = await H().connection.subscribeEvents(onAction, 'mobile_app_notification_action');
+    if (G.opts.expert) {
+      G.opts.share = false;
+      if (convOn() && expertOn()) { G.convLast = Date.now(); G.ask(pick(HELLO_EXPERT), { satellite: G.lastSat || DEFAULT_SAT }).catch(() => {}); }
+    }
     if (!G.looping) { G.looping = true; loop(); }
     if (G.opts.testOnly) { G.sandbox = true; try { localStorage.setItem('guardiano_test_ready', String(G.opts.runId)); } catch (e) {} }
     return 'pronto: ' + G.pipes.map((p) => p.name).join(', ');
@@ -442,6 +548,19 @@
     states: (ids) => cut([].concat(ids).map((id) => { const s = H().states[id]; if (!s) return id + ' non trovato'; const a = s.attributes; return (a.friendly_name || id) + ': ' + s.state + (a.volume_level != null ? ' vol ' + Math.round(a.volume_level * 100) + '%' : '') + (a.is_volume_muted ? ' muto' : '') + (a.media_title ? ' "' + a.media_title + '"' : ''); }).join(' | ')),
     // find entities by words in the id or name
     find: (text) => { const w = String(text).toLowerCase(); return cut(Object.values(H().states).filter((s) => (s.entity_id + ' ' + (s.attributes.friendly_name || '')).toLowerCase().includes(w)).slice(0, 15).map((s) => s.entity_id + '=' + s.state).join(' | ')); },
+    // Version 17: the TV PC seen from inside: real VPN state and public IP, open windows, last lines of its log
+    // (log.txt of the launcher scripts, routine noise removed). n lines, default 12. Takes 3 to 10 s.
+    pc: async (n) => {
+      n = Math.max(3, Math.min(40, n || 12));
+      let got = null; const un = await H().connection.subscribeEvents((e) => { got = e.data; }, 'guardiano_pc');
+      try {
+        await G.realSend({ type: 'call_service', domain: 'input_text', service: 'set_value', target: { entity_id: 'input_text.tv_italia_cmd' }, service_data: { value: 'pclog ' + n + '|' + Math.floor(Date.now() / 1000) } });
+        for (let k = 0; k < 40 && !got; k++) await new Promise((r) => wSet(r, 500));
+      } finally { un(); }
+      if (!got) return 'PC: nessuna risposta in 20 s (PC spento o launcher fermo)';
+      const lines = String(got.lines || '').split('\n').map((l) => l.slice(0, 115)).join(' / ');
+      return clean('VPN ' + got.vpn + ' (' + got.region + '), IP ' + got.ip + ' | finestre: ' + String(got.windows || '').slice(0, 160) + ' | log: ' + lines, 880);
+    },
   };
 
   // Version 14: diagnostics also kept per run in localStorage guardiano_dbg_hist (last 6 runs), and a clean stop is marked,
@@ -450,11 +569,16 @@
     try {
       const snap = { run: G.opts.runId, loopAt: G.dbg.loopAt, pollOkAt: G.dbg.pollOkAt, monAt: G.dbg.monAt, lastErr: G.dbg.lastErr, life: G.dbg.life.slice(-8), vis: document.visibilityState, q: G.queue.length, keep: G.dbg.keep };
       if (end) snap.end = Date.now();
-      localStorage.setItem('guardiano_dbg', JSON.stringify(snap));
+      localStorage.setItem(G.opts.expert ? 'guardiano_dbg_esperto' : 'guardiano_dbg', JSON.stringify(snap));
       let h = []; try { h = JSON.parse(localStorage.getItem('guardiano_dbg_hist') || '[]'); } catch (e) {}
       h = h.filter((x) => x.run !== snap.run); h.push(snap);
       localStorage.setItem('guardiano_dbg_hist', JSON.stringify(h.slice(-6)));
     } catch (e) {}
   };
-  G.stop = () => { if (!G.opts.testOnly) G.saveDbg(true); G.stopped = true; if (G.unsub) { G.unsub(); G.unsub = null; } };
+  G.stop = () => {
+    if (!G.opts.testOnly) G.saveDbg(true); G.stopped = true;
+    if (G.unsub) { G.unsub(); G.unsub = null; } if (G.unsubAct) { G.unsubAct(); G.unsubAct = null; }
+    // the expert hands the conversation back when it ends
+    if (G.opts.expert && !G.opts.testOnly) { try { G.realSend({ type: 'call_service', domain: 'input_boolean', service: 'turn_off', target: { entity_id: EXPERT } }); } catch (e) {} }
+  };
 })();
