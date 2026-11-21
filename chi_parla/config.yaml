@@ -1,5 +1,5 @@
 name: Chi parla
-version: "1.0.0"
+version: "1.0.1"
 slug: chi_parla
 description: >-
   Speech to text for Gervàsia that also recognises who is speaking. Audio goes on
@@ -17,11 +17,14 @@ ports:
 map:
   - type: share
     read_only: false
+  - type: homeassistant_config
+    read_only: true
 options:
   stt_entity: stt.home_assistant_cloud
   helper: input_text.chi_parla
   voiceprints: /share/chi_parla/voiceprints.json
   log_file: /share/chi_parla/log.jsonl
+  enroll_zip: /share/chi_parla/registrazioni.zip
   min_score: 0.45
   min_margin: 0.08
 schema:
@@ -29,5 +32,6 @@ schema:
   helper: str
   voiceprints: str
   log_file: str
+  enroll_zip: str
   min_score: float
   min_margin: float

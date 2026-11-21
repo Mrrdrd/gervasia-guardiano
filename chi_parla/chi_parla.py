@@ -49,8 +49,46 @@ extractor = sherpa_onnx.SpeakerEmbeddingExtractor(
 PRINTS = {}
 
 
+ENROLL_ZIPS = [OPT.get("enroll_zip", "/share/chi_parla/registrazioni.zip"),
+               "/homeassistant/www/ehi_gervasia_68433373cdb9.zip"]
+
+
+def enroll():
+    """Build voiceprints from a zip of labeled clips named <person>_<anything>.wav."""
+    import io
+    import wave
+    import zipfile
+    src = next((z for z in ENROLL_ZIPS if os.path.exists(z)), None)
+    if not src:
+        return
+    acc = {}
+    with zipfile.ZipFile(src) as z:
+        for n in z.namelist():
+            if not n.lower().endswith(".wav"):
+                continue
+            who = os.path.basename(n).split("_")[0].lower()
+            w = wave.open(io.BytesIO(z.read(n)))
+            pcm = np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16).astype(np.float32) / 32768.0
+            if w.getnchannels() > 1:
+                pcm = pcm.reshape(-1, w.getnchannels()).mean(1)
+            s = extractor.create_stream()
+            s.accept_waveform(w.getframerate(), pcm)
+            s.input_finished()
+            e = np.array(extractor.compute(s), dtype=np.float32)
+            acc.setdefault(who, []).append(e / np.linalg.norm(e))
+    prints = {k: (np.mean(v, 0) / np.linalg.norm(np.mean(v, 0))).round(5).tolist() for k, v in acc.items()}
+    os.makedirs(os.path.dirname(VOICEPRINTS), exist_ok=True)
+    json.dump(prints, open(VOICEPRINTS, "w"))
+    log.info("enrolled from %s: %s", src, {k: len(v) for k, v in acc.items()})
+
+
 def load_prints():
     global PRINTS
+    if not os.path.exists(VOICEPRINTS):
+        try:
+            enroll()
+        except Exception as e:
+            log.warning("enrollment failed: %s", e)
     try:
         raw = json.load(open(VOICEPRINTS))
         PRINTS = {k: np.array(v, dtype=np.float32) / np.linalg.norm(v) for k, v in raw.items()}
