@@ -28,8 +28,8 @@
    them every 10 s to localStorage guardiano_dbg, readable from any Home Assistant tab).
    The fix list helper shortens each title to 40 characters so more items fit. */
 (function () {
-  if (window.__G && window.__G.v === 17) return;
-  const G = (window.__G = { v: 17 });
+  if (window.__G && window.__G.v === 18) return;
+  const G = (window.__G = { v: 18 });
   const H = () => document.querySelector('home-assistant').hass;
   // every websocket call gets a 15 s limit: after a reconnection a pending call can stay unanswered for ever, which froze the loop
   const WS = (msg) => new Promise((res, rej) => { let d = false; const t = wSet(() => { if (!d) { d = true; rej(new Error('ws timeout ' + msg.type)); } }, 15000); H().connection.sendMessagePromise(msg).then((v) => { if (!d) { d = true; wClear(t); res(v); } }, (e) => { if (!d) { d = true; wClear(t); rej(e); } }); });
@@ -130,7 +130,16 @@
       errors: ev.filter((e) => e.type === 'error').map((e) => (e.data && e.data.code) || 'error'),
       failed: OBVIOUS.test(reply) || ev.some((e) => e.type === 'error' && !['stt-no-text-recognized', 'duplicate_wake_up_detected'].includes(e.data && e.data.code)),
       intentEndMs: ie ? Date.parse(ie.timestamp) : null, replyLen: reply.length,
+      chi: chiFor(run.timestamp),
     };
+  }
+  // Version 18, Nov 21: who spoke, from the Chi parla speech service on the HP (input_text.chi_parla = "Name|alta|unix").
+  // It is written just before the transcript, so it belongs to a run when its time is within a minute after the run started.
+  function chiFor(ts) {
+    const v = String((H().states['input_text.chi_parla'] || {}).state || '').split('|');
+    const t = Number(v[2]) * 1000, r = Date.parse(ts);
+    if (v.length < 3 || !(t >= r - 2000 && t <= r + 60000)) return 'non noto';
+    return v[0] === 'Sconosciuto' ? 'voce non riconosciuta' : v[0];
   }
   // Version 17.2, Nov 21: in a conversation the device listens right after speaking and sometimes hears its own voice
   // back, with small transcription differences (12:21 "la ricerca su Netflix è durata 75 secondi"). An utterance counts as
@@ -564,6 +573,11 @@
     traces: async (script, n) => {
       const l = (await WS({ type: 'trace/list', domain: 'script', item_id: script })).sort((a, b) => (a.timestamp.start < b.timestamp.start ? 1 : -1)).slice(0, n || 2);
       return cut(l.map((t) => hm(t.timestamp.start) + ' ' + t.state + (t.script_execution ? ' ' + t.script_execution : '') + (t.error ? ' errore: ' + t.error : '') + (t.timestamp.finish ? ' durata ' + Math.round((Date.parse(t.timestamp.finish) - Date.parse(t.timestamp.start)) / 1000) + ' s' : '')).join(' | ') || 'nessuna traccia');
+    },
+    // who spoke in the last minutes, from the Chi parla speech service (name or Sconosciuto, one line per request)
+    chi: async (min) => {
+      const r = await WS({ type: 'logbook/get_events', start_time: new Date(Date.now() - 60000 * (min || 60)).toISOString(), entity_ids: ['input_text.chi_parla'] });
+      return cut(r.slice(-15).map((e) => hm(e.when * 1000) + ' ' + String(e.state || '').split('|')[0]).join(' | ') || 'nessuna voce riconosciuta');
     },
     mics: () => cut(MICS.map((m) => nm(m) + ': ' + ((H().states[m] || {}).state === 'on' ? 'microfono MUTO' : 'microfono attivo')).join(' | ')),
     // compact states with volume and title, for a few entities
