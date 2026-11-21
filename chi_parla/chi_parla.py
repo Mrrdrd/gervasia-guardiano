@@ -33,8 +33,8 @@ STT_ENTITY = OPT.get("stt_entity", "stt.home_assistant_cloud")
 HELPER = OPT.get("helper", "input_text.chi_parla")
 VOICEPRINTS = OPT.get("voiceprints", "/share/chi_parla/voiceprints.json")
 LOG_FILE = OPT.get("log_file", "/share/chi_parla/log.jsonl")
-MIN_SCORE = float(OPT.get("min_score", 0.45))
-MIN_MARGIN = float(OPT.get("min_margin", 0.08))
+MIN_SCORE = float(OPT.get("min_score", 0.35))
+MIN_MARGIN = float(OPT.get("min_margin", 0.10))
 MODEL = os.environ.get("CHI_MODEL", "/app/campplus.onnx")
 API = os.environ.get("CHI_API", "http://supervisor/core/api")
 TOKEN = os.environ.get("SUPERVISOR_TOKEN", "")
@@ -101,10 +101,10 @@ def load_prints():
 def identify(pcm: bytes, rate: int):
     """Return (name, score, margin) for 16-bit mono PCM."""
     if not PRINTS:
-        return "sconosciuto", 0.0, 0.0
+        return "sconosciuto", 0.0, 0.0, ""
     w = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
     if len(w) < rate * 0.8:  # under 0.8 s of audio: too short to judge
-        return "sconosciuto", 0.0, 0.0
+        return "sconosciuto", 0.0, 0.0, ""
     s = extractor.create_stream()
     s.accept_waveform(rate, w)
     s.input_finished()
@@ -114,7 +114,7 @@ def identify(pcm: bytes, rate: int):
     best, second = sc[0], (sc[1] if len(sc) > 1 else (0.0, ""))
     margin = best[0] - second[0]
     name = best[1] if best[0] >= MIN_SCORE and margin >= MIN_MARGIN else "sconosciuto"
-    return name, best[0], margin
+    return name, best[0], margin, best[1]
 
 
 def lang(code: str) -> str:
@@ -184,6 +184,7 @@ class Handler(AsyncEventHandler):
                 await self.write_event(Transcript(text="").event())
                 return False
             self.q.put_nowait(None)
+            self.t_stop = time.time()
             loop = asyncio.get_running_loop()
             who = loop.run_in_executor(None, partial(identify, bytes(self.pcm), self.rate))
             text = ""
@@ -191,9 +192,9 @@ class Handler(AsyncEventHandler):
                 text = await self.task
             except Exception as e:
                 log.error("stt failed: %s", e)
-            name, score, margin = "sconosciuto", 0.0, 0.0
+            name, score, margin, cand = "sconosciuto", 0.0, 0.0, ""
             try:
-                name, score, margin = await asyncio.wait_for(who, timeout=1.5)
+                name, score, margin, cand = await asyncio.wait_for(who, timeout=1.5)
                 conf = "alta" if name != "sconosciuto" else "bassa"
                 await self.session.post(f"{API}/services/input_text/set_value", headers=HDR,
                                         json={"entity_id": HELPER,
@@ -202,11 +203,11 @@ class Handler(AsyncEventHandler):
             except Exception as e:
                 log.warning("speaker id skipped: %s", e)
             secs = len(self.pcm) / 2 / max(self.rate, 1)
-            log.info("%.1fs audio, %.2fs total: %s (%.2f, +%.2f) | %s", secs, time.time() - self.t0,
-                     name, score, margin, text[:60])
+            log.info("%.1fs audio, %.2fs after the end: %s (best %s %.2f, +%.2f) | %s", secs,
+                     time.time() - self.t_stop, name, cand, score, margin, text[:60])
             try:
                 with open(LOG_FILE, "a") as f:
-                    f.write(json.dumps({"t": int(time.time()), "chi": name, "score": round(score, 3),
+                    f.write(json.dumps({"t": int(time.time()), "chi": name, "migliore": cand, "score": round(score, 3),
                                         "margine": round(margin, 3), "secondi": round(secs, 1),
                                         "testo": text}, ensure_ascii=False) + "\n")
             except Exception:

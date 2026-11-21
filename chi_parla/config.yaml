@@ -1,5 +1,5 @@
 name: Chi parla
-version: "1.0.1"
+version: "1.0.2"
 slug: chi_parla
 description: >-
   Speech to text for Gervàsia that also recognises who is speaking. Audio goes on
@@ -25,8 +25,8 @@ options:
   voiceprints: /share/chi_parla/voiceprints.json
   log_file: /share/chi_parla/log.jsonl
   enroll_zip: /share/chi_parla/registrazioni.zip
-  min_score: 0.45
-  min_margin: 0.08
+  min_score: 0.35
+  min_margin: 0.10
 schema:
   stt_entity: str
   helper: str
