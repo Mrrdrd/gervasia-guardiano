@@ -51,18 +51,15 @@
   const isConvPipe = (p) => /^guardiano$/i.test((p && p.name) || '');
   const pick = (a) => a[Math.floor(Math.random() * a.length)];
   // Nov 21: people never hear about a guardian or an expert: every line is Gervàsia's own voice.
-  const FILL = ['Fammici pensare un attimo.', 'Questo lo devo cercare, un secondo.', 'Vediamo un po\'.', 'Controllo subito, dammi un attimo.',
-    'Un momento che guardo.', 'Bella domanda, ci penso.', 'Aspetta che do un\'occhiata.', 'Ci guardo subito.'];
-  const FILL_EXPERT = ['Fammi ragionare con calma.', 'Mi metto gli occhiali e guardo bene.', 'Analizzo con calma, un attimo di pazienza.',
-    'Qui ci vuole un ragionamento serio, dammi qualche secondo.', 'Controllo un po\' di cose e faccio due conti.', 'Mmm, interessante. Ci penso su.',
-    'Lasciami mettere insieme i pezzi.', 'Sto incrociando un po\' di indizi.', 'Faccio la detective per un momento.', 'Indago e torno da te tra poco.',
-    'Fammi controllare tutto per bene.', 'Un attimo, sto ricostruendo cosa è successo.'];
-  // Nov 21: when the sentence that opened the conversation already says the problem, never ask for it again
-  const HELLO = ['Eccomi. Dimmi pure cosa non va.', 'Certo, guardiamoci insieme. Cosa è successo?', 'Ci sono. Cosa non ha funzionato?'];
-  const HELLO_Q = ['Vediamo un po\'.', 'Ci guardo subito.', 'Fammi controllare.', 'Un attimo che guardo.'];
-  const HELLO_EXPERT = ['Eccomi, ho guardato con calma.', 'Rieccomi, adesso ho tutto sotto mano.', 'Ci sono, ho controllato un po\' di cose.', 'Eccomi di nuovo.'];
-  const CALL_EXPERT = ['Questa richiede un ragionamento in più, dammi un minuto.', 'Fammi guardare con più calma, mi serve circa un minuto.',
-    'Ci penso con attenzione, un minuto e torno da te.'];
+  // Nov 21 v17.4: playful set chosen by Gabe. People never hear about a guardian or an expert: every line is Gervàsia's own voice.
+  const FILL = ['Fammici pensare un attimo.', 'Questo lo devo cercare, un secondo.', 'Controllo subito, dammi un attimo.', 'Un momento che guardo.', 'Bella domanda, ci penso.', 'Aspetta che do un\'occhiata.', 'Frugo nei cassetti, un attimo.', 'Accendo i neuroni, un secondo.', 'Mmm, sento puzza di indizio.', 'Sfoglio i miei appunti.', 'Un attimo, sto facendo due più due.', 'Faccio una sbirciatina dietro le quinte.'];
+  const FILL_EXPERT = ['Fammi ragionare con calma.', 'Mi metto gli occhiali e guardo bene.', 'Analizzo con calma, un attimo di pazienza.', 'Qui ci vuole un ragionamento serio, dammi qualche secondo.', 'Controllo un po\' di cose e faccio due conti.', 'Mmm, interessante. Ci penso su.', 'Lasciami mettere insieme i pezzi.', 'Sto incrociando un po\' di indizi.', 'Faccio la detective per un momento.', 'Indago e torno da te tra poco.', 'Fammi controllare tutto per bene.', 'Un attimo, sto ricostruendo cosa è successo.', 'Elementare, Watson... quasi. Un attimo.', 'Sto interrogando i testimoni: la TV, il PC e il modem.', 'Ho trovato una pista, la seguo.'];
+  // When the sentence that opened the conversation already says the problem, never ask for it again
+  const HELLO = ['Eccomi. Dimmi pure cosa non va.', 'Certo, guardiamoci insieme. Cosa è successo?', 'Ci sono. Cosa non ha funzionato?', 'Sono tutta orecchi. Cosa combina la casa?', 'Eccomi, pronta a indagare. Cos\'è successo?', 'Chi ha fatto i capricci, la TV o io?'];
+  const HELLO_Q = ['Vediamo un po\'.', 'Ci guardo subito.', 'Fammi controllare.', 'Un attimo che guardo.', 'Ricevuto, apro il fascicolo.', 'Capito, vado a curiosare.', 'Ok, accendo la lente d\'ingrandimento.', 'Chiaro. Vado a ficcanasare un attimo.'];
+  const HELLO_EXPERT = ['Eccomi, ho guardato con calma.', 'Rieccomi, adesso ho tutto sotto mano.', 'Ci sono, ho controllato un po\' di cose.', 'Eccomi di nuovo.', 'Rieccomi, e ho novità!', 'Tornata dal laboratorio, ho capito qualcosa.', 'Ta dan, eccomi qua.'];
+  const CALL_EXPERT = ['Questa richiede un ragionamento in più, dammi un minuto.', 'Fammi guardare con più calma, mi serve circa un minuto.', 'Ci penso con attenzione, un minuto e torno da te.', 'Questa è tosta! Mi prendo un minuto e un caffè.', 'Mi chiudo un minuto nel mio laboratorio segreto.', 'Caso complicato. Un minuto e torno con la soluzione.', 'Dammi un minuto, qui ci vuole tutta la mia materia grigia.'];
+  const MISSING = ['Scusa l\'attesa. Dimmi pure.', 'Scusa l\'attesa, continuiamo.', 'Scusa, mi ero persa nei miei pensieri. Continuiamo.', 'Eccomi, ero rimasta incastrata nei registri. Dove eravamo?'];
   const convOn = () => (H().states[CONV] || {}).state === 'on';
   const expertOn = () => (H().states[EXPERT] || {}).state === 'on';
   // the run that holds the conversation: the expert run when EXPERT is on, otherwise the normal run in charge
@@ -347,7 +344,7 @@
       G.expertAskedAt = 0;
       H().callService('input_boolean', 'turn_off', {}, { entity_id: EXPERT }).catch(() => {});
       push({ kind: 'expert_missing', time: NY(Date.now()) });
-      G.ask('Scusa l\'attesa. Dimmi pure.', { satellite: G.lastSat || DEFAULT_SAT }).catch(() => {});
+      G.ask(pick(MISSING), { satellite: G.lastSat || DEFAULT_SAT }).catch(() => {});
     }
     if (!expertOn()) G.expertAskedAt = 0;
   }
