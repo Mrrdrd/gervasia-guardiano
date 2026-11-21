@@ -57,9 +57,10 @@
     'Qui ci vuole un ragionamento serio, dammi qualche secondo.', 'Controllo un po\' di cose e faccio due conti.', 'Mmm, interessante. Ci penso su.',
     'Lasciami mettere insieme i pezzi.', 'Sto incrociando un po\' di indizi.', 'Faccio la detective per un momento.', 'Indago e torno da te tra poco.',
     'Fammi controllare tutto per bene.', 'Un attimo, sto ricostruendo cosa è successo.'];
-  const HELLO = ['Eccomi. Dimmi pure cosa non va.', 'Certo, guardiamoci insieme. Raccontami.', 'Ci sono. Cosa è successo?'];
-  const HELLO_EXPERT = ['Eccomi, adesso ho tutto sotto mano. Raccontami ancora cosa non va.', 'Rieccomi, ho guardato con calma. Dimmi.',
-    'Ci sono, ho controllato un po\' di cose. Partiamo dal problema.', 'Eccomi. Ora possiamo guardarci per bene.'];
+  // Nov 21: when the sentence that opened the conversation already says the problem, never ask for it again
+  const HELLO = ['Eccomi. Dimmi pure cosa non va.', 'Certo, guardiamoci insieme. Cosa è successo?', 'Ci sono. Cosa non ha funzionato?'];
+  const HELLO_Q = ['Vediamo un po\'.', 'Ci guardo subito.', 'Fammi controllare.', 'Un attimo che guardo.'];
+  const HELLO_EXPERT = ['Eccomi, ho guardato con calma.', 'Rieccomi, adesso ho tutto sotto mano.', 'Ci sono, ho controllato un po\' di cose.', 'Eccomi di nuovo.'];
   const CALL_EXPERT = ['Questa richiede un ragionamento in più, dammi un minuto.', 'Fammi guardare con più calma, mi serve circa un minuto.',
     'Ci penso con attenzione, un minuto e torno da te.'];
   const convOn = () => (H().states[CONV] || {}).state === 'on';
@@ -265,6 +266,19 @@
   }
 
   /* ---------- conversation with the guardian (v17) ---------- */
+  // the words of the request that opened the conversation, if they say more than "vediamo insieme"
+  async function openingQuestion() {
+    try {
+      const l = await WS({ type: 'assist_pipeline/pipeline_debug/list', pipeline_id: G.voicePipe.id });
+      const r = (l.pipeline_runs || []).slice(-1)[0];
+      if (!r || Date.now() - Date.parse(r.timestamp) > 60000) return '';
+      const d = await WS({ type: 'assist_pipeline/pipeline_debug/get', pipeline_id: G.voicePipe.id, pipeline_run_id: r.pipeline_run_id });
+      const st = (d.events || []).find((e) => e.type === 'stt-end');
+      const t = (st && st.data && st.data.stt_output && st.data.stt_output.text) || '';
+      const bare = t.toLowerCase().replace(/[^\p{L} ]/gu, ' ').replace(/\b(gervasia|gervàsia|ehi|alexa|vediamo|insieme|ce|c|è|un|problema|aiuto|aiutami|guardiano|esperto|parla|con|il|chiama|cosa|successo)\b/g, ' ').trim();
+      return bare.length >= 8 ? clean(t, 300) : '';
+    } catch (e) { return ''; }
+  }
   async function convStart() {
     await new Promise((r) => wSet(r, 1500)); // let the EXPERT switch settle (the script sets it just before CONV)
     const sat = G.lastSat || DEFAULT_SAT;
@@ -275,8 +289,11 @@
       G.say(pick(CALL_EXPERT), { satellite: sat }).catch(() => {});
       return;
     }
-    push({ kind: 'conv_start', expert: false, satellite: sat, time: NY(Date.now()) });
-    G.ask(pick(HELLO), { satellite: sat }).catch(() => {});
+    // the sentence that opened the conversation (Gervàsia's last run): when it already says the problem, answer it
+    const q = await openingQuestion();
+    push(Object.assign({ kind: 'conv_start', expert: false, satellite: sat, time: NY(Date.now()) }, q ? { question: q } : {}));
+    if (q) G.say(pick(HELLO_Q), { satellite: sat }).catch(() => {});
+    else G.ask(pick(HELLO), { satellite: sat }).catch(() => {});
   }
   // a short "let me think" right after each sentence of the conversation, before the model starts reasoning
   G.filler = async (v) => {
@@ -379,7 +396,7 @@
     if (!G.unsubAct && !G.opts.testOnly) G.unsubAct = await H().connection.subscribeEvents(onAction, 'mobile_app_notification_action');
     if (G.opts.expert) {
       G.opts.share = false;
-      if (convOn() && expertOn()) { G.convLast = Date.now(); G.ask(pick(HELLO_EXPERT), { satellite: G.lastSat || DEFAULT_SAT }).catch(() => {}); }
+      if (convOn() && expertOn()) { G.convLast = Date.now(); G.say(pick(HELLO_EXPERT), { satellite: G.lastSat || DEFAULT_SAT }).catch(() => {}); }
     }
     if (!G.looping) { G.looping = true; loop(); }
     if (G.opts.testOnly) { G.sandbox = true; try { localStorage.setItem('guardiano_test_ready', String(G.opts.runId)); } catch (e) {} }
