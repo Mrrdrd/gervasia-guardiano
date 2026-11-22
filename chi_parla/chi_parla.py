@@ -140,6 +140,7 @@ def save_negative(pcm: bytes, rate: int):
             w.setsampwidth(2)
             w.setframerate(rate)
             w.writeframes(pcm)
+        log.info("saved negative %s (%d kept)", os.path.basename(fn), len(os.listdir(NEG_DIR)))
     except Exception as e:
         log.warning("negative not saved: %s", e)
 
@@ -182,6 +183,15 @@ class Handler(AsyncEventHandler):
             if j.get("result") != "success":
                 log.warning("stt result %s", j)
             return j.get("text") or ""
+
+    async def disconnect(self) -> None:
+        # Home Assistant closed the connection (request cancelled mid-speech): stop the cloud upload too,
+        # so it does not hang until its 30 s timeout.
+        if self.task is not None and not self.task.done():
+            log.info("request closed by Home Assistant after %.1fs of audio", len(self.pcm) / 2 / max(self.rate, 1))
+            if self.q is not None:
+                self.q.put_nowait(None)
+            self.task.cancel()
 
     async def handle_event(self, event: Event) -> bool:
         if Describe.is_type(event.type):
