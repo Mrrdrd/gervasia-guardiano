@@ -117,6 +117,33 @@ def identify(pcm: bytes, rate: int):
     return name, best[0], margin, best[1]
 
 
+SAVE_NEG = bool(OPT.get("save_negatives", True))
+NEG_DIR = OPT.get("negatives_dir", "/share/chi_parla/negativi")
+NEG_DAYS = int(OPT.get("negatives_days", 14))
+
+
+def save_negative(pcm: bytes, rate: int):
+    """Keep the audio of activations where nothing intelligible was heard (noise, TV), up to 5 s,
+    as negative examples for retraining the wake word. Requests with words are never saved.
+    Files older than negatives_days are deleted."""
+    import wave
+    try:
+        os.makedirs(NEG_DIR, exist_ok=True)
+        now = time.time()
+        for f in os.listdir(NEG_DIR):
+            fp = os.path.join(NEG_DIR, f)
+            if os.path.isfile(fp) and now - os.path.getmtime(fp) > NEG_DAYS * 86400:
+                os.remove(fp)
+        fn = os.path.join(NEG_DIR, time.strftime("%Y%m%d_%H%M%S") + ".wav")
+        with wave.open(fn, "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(rate)
+            w.writeframes(pcm)
+    except Exception as e:
+        log.warning("negative not saved: %s", e)
+
+
 def lang(code: str) -> str:
     code = (code or "it-IT").replace("_", "-")
     return {"it": "it-IT", "en": "en-US"}.get(code, code)
@@ -212,7 +239,12 @@ class Handler(AsyncEventHandler):
                                         "testo": text}, ensure_ascii=False) + "\n")
             except Exception:
                 pass
-            await self.write_event(Transcript(text=text).event())
+            if SAVE_NEG and not text.strip() and len(self.pcm) > 0:
+                save_negative(bytes(self.pcm[: self.rate * 2 * 5]), self.rate)
+            try:
+                await self.write_event(Transcript(text=text).event())
+            except (ConnectionResetError, BrokenPipeError) as e:
+                log.warning("Home Assistant closed the request before the transcript: %s", e)
             self.reset()
             return False
         return True
