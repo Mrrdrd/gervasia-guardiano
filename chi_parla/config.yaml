@@ -1,5 +1,5 @@
 name: Chi parla
-version: "1.0.4"
+version: "1.0.5"
 slug: chi_parla
 description: >-
   Speech to text for Gervàsia that also recognises who is speaking. Audio goes on

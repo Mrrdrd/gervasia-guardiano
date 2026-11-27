@@ -117,6 +117,17 @@ def identify(pcm: bytes, rate: int):
     return name, best[0], margin, best[1]
 
 
+# OpenAI speech to text, when the audio holds no speech (room noise during follow-up listening),
+# sometimes returns its own hint sentence ("Una famiglia italiana parla in casa con l'assistente...").
+# Such a transcript is treated as "nothing heard", so Gervàsia never answers it.
+ECHO_MARKERS = ("famiglia italiana parla in casa", "nomi e titoli frequenti")
+
+
+def is_prompt_echo(text: str) -> bool:
+    t = (text or "").lower()
+    return any(m in t for m in ECHO_MARKERS)
+
+
 SAVE_NEG = bool(OPT.get("save_negatives", True))
 NEG_DIR = OPT.get("negatives_dir", "/share/chi_parla/negativi")
 NEG_DAYS = int(OPT.get("negatives_days", 14))
@@ -229,6 +240,10 @@ class Handler(AsyncEventHandler):
                 text = await self.task
             except Exception as e:
                 log.error("stt failed: %s", e)
+            dropped = ""
+            if is_prompt_echo(text):
+                dropped, text = text, ""
+                log.info("dropped a made-up transcript (the speech to text hint): %s", dropped[:60])
             name, score, margin, cand = "sconosciuto", 0.0, 0.0, ""
             try:
                 name, score, margin, cand = await asyncio.wait_for(who, timeout=1.5)
@@ -246,7 +261,8 @@ class Handler(AsyncEventHandler):
                 with open(LOG_FILE, "a") as f:
                     f.write(json.dumps({"t": int(time.time()), "chi": name, "migliore": cand, "score": round(score, 3),
                                         "margine": round(margin, 3), "secondi": round(secs, 1),
-                                        "testo": text}, ensure_ascii=False) + "\n")
+                                        "testo": text, **({"scartato": dropped[:200]} if dropped else {})},
+                                       ensure_ascii=False) + "\n")
             except Exception:
                 pass
             if SAVE_NEG and not text.strip() and len(self.pcm) > 0:
